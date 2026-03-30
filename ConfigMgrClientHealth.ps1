@@ -52,7 +52,6 @@ param(
 Begin {
     # ConfigMgr Client Health Version
     $Version = '0.8.3'
-    $PowerShellVersion = [int]$PSVersionTable.PSVersion.Major
     $global:ScriptPath = split-path -parent $MyInvocation.MyCommand.Definition
 
     #If no config file was passed in, use the default.
@@ -62,7 +61,25 @@ Begin {
     }
 
     Write-Verbose "Script version: $Version"
-    Write-Verbose "PowerShell version: $PowerShellVersion"
+    Write-Verbose "PowerShell version: $($PSVersionTable.PSVersion)"
+
+    # Retry helper for transient failures (SQL connections, service starts)
+    Function Invoke-WithRetry {
+        Param(
+            [Parameter(Mandatory=$true)][scriptblock]$ScriptBlock,
+            [int]$MaxRetries = 3,
+            [int]$DelaySeconds = 5,
+            [string]$OperationName = 'Operation'
+        )
+        for ($i = 1; $i -le $MaxRetries; $i++) {
+            try { return (& $ScriptBlock) }
+            catch {
+                if ($i -eq $MaxRetries) { throw }
+                Write-Warning "$OperationName failed (attempt $i/$MaxRetries): $_. Retrying in ${DelaySeconds}s..."
+                Start-Sleep -Seconds $DelaySeconds
+            }
+        }
+    }
 
     Function Test-XML {
         <#
@@ -279,8 +296,7 @@ Begin {
 
         #If the event log doesn't contain a start event then use the start time of the service's process.  Since processes can be shared this is less reliable.
         Try{
-            if ($PowerShellVersion -ge 6) { $ServiceProcessID = (Get-CimInstance Win32_Service -Filter "Name='$($Name)'").ProcessID }
-            else { $ServiceProcessID = (Get-WMIObject -Class Win32_Service -Filter "Name='$($Name)'").ProcessID }
+            $ServiceProcessID = (Get-CimInstance -ClassName Win32_Service -Filter "Name='$($Name)'").ProcessID
 
             [datetime]$ServiceStartTime = (Get-Process -Id $ServiceProcessID).StartTime
             Return (New-TimeSpan -Start $ServiceStartTime -End (Get-Date)).Days
@@ -382,9 +398,7 @@ Begin {
     }
 
     Function Get-OperatingSystem {
-        if ($PowerShellVersion -ge 6) { $OS = Get-CimInstance Win32_OperatingSystem }
-        else { $OS = Get-WmiObject Win32_OperatingSystem }
-
+        $OS = Get-CimInstance -ClassName Win32_OperatingSystem
 
         # Handles different OS languages
         $OSArchitecture = ($OS.OSArchitecture -replace ('([^0-9])(\.*)', '')) + '-Bit'
@@ -431,8 +445,7 @@ Begin {
         If ((Test-Path $Updates) -eq $true) {
             $regex = "\b(?!(KB)+(\d+)\b)\w+"
             $hotfixes = (Get-ChildItem $Updates | Select-Object -ExpandProperty Name)
-            if ($PowerShellVersion -ge 6) { $installedUpdates = (Get-CimInstance -ClassName Win32_QuickFixEngineering).HotFixID }
-            else { $installedUpdates = Get-Hotfix | Select-Object -ExpandProperty HotFixID }
+            $installedUpdates = (Get-CimInstance -ClassName Win32_QuickFixEngineering).HotFixID
 
             foreach ($hotfix in $hotfixes) {
                 $kb = $hotfix -replace $regex -replace "\." -replace "-"
@@ -483,8 +496,7 @@ Begin {
 
     Function Get-ClientVersion {
         try {
-            if ($PowerShellVersion -ge 6) { $obj = (Get-CimInstance -Namespace root/ccm SMS_Client).ClientVersion }
-            else { $obj = (Get-WmiObject -Namespace root/ccm SMS_Client).ClientVersion }
+            $obj = (Get-CimInstance -Namespace root/ccm -ClassName SMS_Client).ClientVersion
         }
         catch { $obj = $false }
         finally { Write-Output $obj }
@@ -519,8 +531,7 @@ Begin {
 
     Function Get-Domain {
         try {
-            if ($PowerShellVersion -ge 6) { $obj = (Get-CimInstance Win32_ComputerSystem).Domain }
-            else { $obj = (Get-WmiObject Win32_ComputerSystem).Domain }
+            $obj = (Get-CimInstance -ClassName Win32_ComputerSystem).Domain
         }
         catch { $obj = $false }
         finally { Write-Output $obj }
@@ -686,7 +697,7 @@ Begin {
                 if ($fix -eq "true") {
                     $text = "BITS: Error. Remediating"
                     $Errors | Remove-BitsTransfer -ErrorAction SilentlyContinue
-                    Invoke-Expression -Command 'sc.exe sdset bits "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;AU)(A;;CCLCSWRPWPDTLOCRRC;;;PU)"' | out-null
+                    & sc.exe sdset bits 'D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;AU)(A;;CCLCSWRPWPDTLOCRRC;;;PU)' | Out-Null
                     $log.BITS = 'Remediated'
                     $obj = $true
                 }
@@ -718,7 +729,7 @@ Begin {
 	Function Test-ClientSettingsConfiguration {
 		Param([Parameter(Mandatory=$true)]$Log)
 
-		$ClientSettingsConfig = @(Get-WmiObject -Namespace "root\ccm\Policy\DefaultMachine\RequestedConfig" -Class CCM_ClientAgentConfig -ErrorAction SilentlyContinue | Where-Object {$_.PolicySource -eq "CcmTaskSequence"})
+		$ClientSettingsConfig = @(Get-CimInstance -Namespace "root\ccm\Policy\DefaultMachine\RequestedConfig" -ClassName CCM_ClientAgentConfig -ErrorAction SilentlyContinue | Where-Object {$_.PolicySource -eq "CcmTaskSequence"})
 
 		if ($ClientSettingsConfig.Count -gt 0) {
 
@@ -727,8 +738,8 @@ Begin {
 			if ($fix -eq "true") {
 				$text = "ClientSettings: Error. Remediating"
 				DO {
-					Get-WmiObject -Namespace "root\ccm\Policy\DefaultMachine\RequestedConfig" -Class CCM_ClientAgentConfig | Where-Object {$_.PolicySource -eq "CcmTaskSequence"} | Select-Object -first 1000 | ForEach-Object {Remove-WmiObject -InputObject $_}
-				} Until (!(Get-WmiObject -Namespace "root\ccm\Policy\DefaultMachine\RequestedConfig" -Class CCM_ClientAgentConfig | Where-Object {$_.PolicySource -eq "CcmTaskSequence"} | Select-Object -first 1))
+					Get-CimInstance -Namespace "root\ccm\Policy\DefaultMachine\RequestedConfig" -ClassName CCM_ClientAgentConfig | Where-Object {$_.PolicySource -eq "CcmTaskSequence"} | Select-Object -first 1000 | Remove-CimInstance
+				} Until (!(Get-CimInstance -Namespace "root\ccm\Policy\DefaultMachine\RequestedConfig" -ClassName CCM_ClientAgentConfig | Where-Object {$_.PolicySource -eq "CcmTaskSequence"} | Select-Object -first 1))
 				$log.ClientSettings = 'Remediated'
 				$obj = $true
 			}
@@ -785,11 +796,10 @@ Begin {
 
         try
         {
-            $util = [wmiclass]'\\.\root\ccm\clientsdk:CCM_ClientUtilities'
-            $status = $util.DetermineIfRebootPending()
+            $status = Invoke-CimMethod -Namespace 'root\ccm\clientsdk' -ClassName 'CCM_ClientUtilities' -MethodName 'DetermineIfRebootPending'
             if(($null -ne $status) -and $status.RebootPending){ $result.SCCMRebootPending = $true }
         }
-        catch{}
+        catch { Write-Verbose "Non-critical check failed: $_" }
 
         #Return Reboot required
         if ($result.ContainsValue($true)) {
@@ -814,22 +824,19 @@ Begin {
 
     Function Get-OSDiskFreeSpace {
 
-        if ($PowerShellVersion -ge 6) { $driveC = Get-CimInstance -Class Win32_LogicalDisk | Where-Object {$_.DeviceID -eq "$env:SystemDrive"} | Select-Object FreeSpace, Size }
-        else { $driveC = Get-WmiObject -Class Win32_LogicalDisk | Where-Object {$_.DeviceID -eq "$env:SystemDrive"} | Select-Object FreeSpace, Size }
+        $driveC = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object {$_.DeviceID -eq "$env:SystemDrive"} | Select-Object FreeSpace, Size
         $freeSpace = (($driveC.FreeSpace / $driveC.Size) * 100)
         Write-Output ([math]::Round($freeSpace,2))
     }
 
     Function Get-Computername {
-        if ($PowerShellVersion -ge 6) { $obj = (Get-CimInstance Win32_ComputerSystem).Name }
-        else { $obj = (Get-WmiObject Win32_ComputerSystem).Name }
+        $obj = (Get-CimInstance -ClassName Win32_ComputerSystem).Name
         Write-Output $obj
     }
 
     Function Get-LastBootTime {
-        if ($PowerShellVersion -ge 6) { $wmi = Get-CimInstance Win32_OperatingSystem }
-        else { $wmi = Get-WmiObject Win32_OperatingSystem }
-        $obj = $wmi.ConvertToDateTime($wmi.LastBootUpTime)
+        $wmi = Get-CimInstance -ClassName Win32_OperatingSystem
+        $obj = $wmi.LastBootUpTime
         Write-Output $obj
     }
 
@@ -880,8 +887,7 @@ Begin {
 
         #$Hotfix = Get-Hotfix | Select-Object -ExpandProperty InstalledOn -ErrorAction SilentlyContinue
 
-        if ($PowerShellVersion -ge 6) { $Hotfix = Get-CimInstance -ClassName Win32_QuickFixEngineering | Select-Object @{Name="InstalledOn";Expression={[DateTime]::Parse($_.InstalledOn,$([System.Globalization.CultureInfo]::GetCultureInfo("en-US")))}} }
-        else { $Hotfix = Get-Hotfix | Select-Object @{l="InstalledOn";e={[DateTime]::Parse($_.psbase.properties["installedon"].value,$([System.Globalization.CultureInfo]::GetCultureInfo("en-US")))}} }
+        $Hotfix = Get-CimInstance -ClassName Win32_QuickFixEngineering | Select-Object @{Name="InstalledOn";Expression={[DateTime]::Parse($_.InstalledOn,$([System.Globalization.CultureInfo]::GetCultureInfo("en-US")))}}
 
         $Hotfix = $Hotfix | Select-Object -ExpandProperty InstalledOn
 
@@ -918,8 +924,7 @@ Begin {
         Param([Parameter(Mandatory=$true)]$Log)
         #$dnsdomain = (Get-WmiObject Win32_NetworkAdapterConfiguration -filter "ipenabled = 'true'").DNSDomain
         $fqdn = [System.Net.Dns]::GetHostEntry([string]"localhost").HostName
-        if ($PowerShellVersion -ge 6) { $localIPs = Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -Match "True"} |  Select-Object -ExpandProperty IPAddress }
-        else { $localIPs = Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -Match "True"} |  Select-Object -ExpandProperty IPAddress }
+        $localIPs = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -Match "True"} |  Select-Object -ExpandProperty IPAddress
         $dnscheck = [System.Net.DNS]::GetHostByName($fqdn)
 
         $OSName = Get-OperatingSystem
@@ -977,8 +982,7 @@ Begin {
                 $fix = (Get-XMLConfigDNSFix).ToLower()
                 if ($fix -eq "true") {
                     $text = 'DNS Check: FAILED. IP address published in DNS do not match IP address on local machine. Trying to resolve by registerting with DNS server'
-                    if ($PowerShellVersion -ge 4) { Register-DnsClient | out-null  }
-                    else { ipconfig /registerdns | out-null }
+                    Register-DnsClient | Out-Null
                     Write-Host $text
                     $log.DNS = $logFail
                     if (-NOT($FileLogLevel -like "clientlocal")) {
@@ -1049,8 +1053,7 @@ Begin {
             $regex = '(?i)^.+-kb[0-9]{6,}-(?:v[0-9]+-)?x[0-9]+\.msu$'
             $hotfixes = @(Get-ChildItem $Updates | Where-Object { $_.Name -match $regex } | Select-Object -ExpandProperty Name)
 
-            if ($PowerShellVersion -ge 6) { $installedUpdates = @((Get-CimInstance Win32_QuickFixEngineering).HotFixID) }
-            else { $installedUpdates = @(Get-Hotfix | Select-Object -ExpandProperty HotFixID) }
+            $installedUpdates = @((Get-CimInstance -ClassName Win32_QuickFixEngineering).HotFixID)
 
             $count = $hotfixes.count
 
@@ -1166,14 +1169,13 @@ Begin {
 
             # Test that we are able to connect to SMS_Client WMI class
             Try {
-                if ($PowerShellVersion -ge 6) { $WMI = Get-CimInstance -Namespace root/ccm -Class SMS_Client -ErrorAction Stop }
-                else { $WMI = Get-WmiObject -Namespace root/ccm -Class SMS_Client -ErrorAction Stop }
+                $WMI = Get-CimInstance -Namespace root/ccm -ClassName SMS_Client -ErrorAction Stop
             } Catch {
                 Write-Verbose 'Failed to connect to WMI namespace "root/ccm" class "SMS_Client". Clearing WMI and tagging client for reinstall to fix.'
 
                 # Clear the WMI namespace to avoid having to uninstall first
                 # This is the same action the install after an uninstall would perform
-                Get-WmiObject -Query "Select * from __Namespace WHERE Name='CCM'" -Namespace root | Remove-WmiObject
+                Get-CimInstance -Query "Select * from __Namespace WHERE Name='CCM'" -Namespace root | Remove-CimInstance
 
                 $Reinstall = $true
                 New-ClientInstalledReason -Log $Log -Message "Failed to connect to SMS_Client WMI class."
@@ -1220,8 +1222,7 @@ Begin {
             $num = $ClientCacheSize -replace '%'
             $num = ($num / 100)
             # TotalDiskSpace in Byte
-            if ($PowerShellVersion -ge 6) { $TotalDiskSpace = (Get-CimInstance -Class Win32_LogicalDisk | Where-Object {$_.DeviceID -eq "$env:SystemDrive"} | Select-Object -ExpandProperty Size) }
-            else { $TotalDiskSpace = (Get-WmiObject -Class Win32_LogicalDisk | Where-Object {$_.DeviceID -eq "$env:SystemDrive"} | Select-Object -ExpandProperty Size) }
+            $TotalDiskSpace = (Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object {$_.DeviceID -eq "$env:SystemDrive"} | Select-Object -ExpandProperty Size)
             $ClientCacheSize = ([math]::Round(($TotalDiskSpace * $num) / 1048576))
         }
         else { $type = 'fixed' }
@@ -1332,11 +1333,10 @@ Begin {
 
             try
             {
-                $util = [wmiclass]'\\.\root\ccm\clientsdk:CCM_ClientUtilities'
-                $status = $util.DetermineIfRebootPending()
+                $status = Invoke-CimMethod -Namespace 'root\ccm\clientsdk' -ClassName 'CCM_ClientUtilities' -MethodName 'DetermineIfRebootPending'
                 if(($null -ne $status) -and $status.RebootPending){ $result.SCCMRebootPending = $true}
             }
-            catch{}
+            catch { Write-Verbose "Non-critical check failed: $_" }
 
             #Return Reboot required
             if ($result.ContainsValue($true)) {
@@ -1368,9 +1368,7 @@ Begin {
             $text = 'ConfigMgr Client Provisioning Mode: YES. Remediating...'
             Write-Warning $text
             Set-ItemProperty -Path $registryPath -Name ProvisioningMode -Value "false"
-            $ArgumentList = @($false)
-            if ($PowerShellVersion -ge 6) { Invoke-CimMethod -Namespace 'root\ccm' -Class 'SMS_Client' -MethodName 'SetClientProvisioningMode' -Arguments @{bEnable=$false} | Out-Null }
-            else { Invoke-WmiMethod -Namespace 'root\ccm' -Class 'SMS_Client' -Name 'SetClientProvisioningMode' -ArgumentList $ArgumentList | Out-Null  }
+            Invoke-CimMethod -Namespace 'root\ccm' -ClassName 'SMS_Client' -MethodName 'SetClientProvisioningMode' -Arguments @{bEnable=$false} | Out-Null
             $log.ProvisioningMode = 'Repaired'
         }
         else {
@@ -1459,8 +1457,8 @@ Begin {
             #Start-Sleep -Seconds 60
 
             Write-Verbose 'Refreshing update policy'
-            Get-SCCMPolicyScanUpdateSource
-            Get-SCCMPolicySourceUpdateMessage
+            Invoke-CCMTrigger -ScheduleID '{00000000-0000-0000-0000-000000000113}'
+            Invoke-CCMTrigger -ScheduleID '{00000000-0000-0000-0000-000000000032}'
 
             $log.WUAHandler = "Repaired ($RepairReason)"
             Write-Output "GPO Cache: $($log.WUAHandler)"
@@ -1588,8 +1586,8 @@ Begin {
             }
 
             if ($Uninstall -eq $true) {
-				Write-Verbose "Trigger ConfigMgr Client uninstallation using Invoke-Expression."
-				Invoke-Expression "&'$ClientShare\ccmsetup.exe' /uninstall"
+				Write-Verbose "Trigger ConfigMgr Client uninstallation."
+				Start-Process -FilePath "$ClientShare\ccmsetup.exe" -ArgumentList @('/uninstall') -NoNewWindow
 
 				$launched = $true
 				do {
@@ -1602,9 +1600,10 @@ Begin {
                 } while ($launched -eq $true)
             }
 
-            Write-Verbose "Trigger ConfigMgr Client installation using Invoke-Expression."
+            $argArray = @($ClientInstallProperties -split '\s+')
+            Write-Verbose "Trigger ConfigMgr Client installation."
             Write-Verbose "Client install string: $ClientShare\ccmsetup.exe $ClientInstallProperties"
-            Invoke-Expression "&'$ClientShare\ccmsetup.exe' $ClientInstallProperties"
+            Start-Process -FilePath "$ClientShare\ccmsetup.exe" -ArgumentList $argArray -NoNewWindow
 
 			$launched = $true
 			do {
@@ -1636,7 +1635,7 @@ Begin {
         param ([string]$FilePath)
 
         try { $Result = Start-Process -FilePath 'regsvr32.exe' -Args "/s `"$FilePath`"" -Wait -NoNewWindow -PassThru }
-        catch {}
+        catch { Write-Verbose "Failed to register $FilePath : $_" }
     }
 
     Function Test-WMI {
@@ -1656,8 +1655,7 @@ Begin {
         }
 
         Try {
-            if ($PowerShellVersion -ge 6) { $WMI = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop }
-            else { $WMI = Get-WmiObject Win32_ComputerSystem -ErrorAction Stop }
+            $WMI = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
         } Catch {
             Write-Verbose 'Failed to connect to WMI class "Win32_ComputerSystem". Voting for WMI fix...'
             $vote++
@@ -1775,7 +1773,7 @@ Begin {
     Function Test-SCCMService {
         if ($service.Status -ne 'Running') {
             try {Start-Service -Name CcmExec | Out-Null}
-            catch {}
+            catch { Write-Warning "Failed to start CcmExec: $_" }
         }
     }
 
@@ -1855,8 +1853,7 @@ Begin {
         }
 
         $service = Get-Service -Name $Name
-        if ($PowerShellVersion -ge 6) { $WMIService = Get-CimInstance -Class Win32_Service -Property StartMode, ProcessID, Status -Filter "Name='$Name'" }
-        else { $WMIService = Get-WmiObject -Class Win32_Service -Property StartMode, ProcessID, Status -Filter "Name='$Name'" }
+        $WMIService = Get-CimInstance -ClassName Win32_Service -Property StartMode, ProcessID, Status -Filter "Name='$Name'"
         $StartMode = ($WMIService.StartMode).ToLower()
 
         switch -Wildcard ($StartMode) {
@@ -2007,8 +2004,7 @@ Begin {
     function Test-AdminShare {
         Param([Parameter(Mandatory=$true)]$Log)
         Write-Verbose "Test the ADMIN$ and C$"
-        if ($PowerShellVersion -ge 6) { $share = Get-CimInstance Win32_Share | Where-Object {$_.Name -like 'ADMIN$'} }
-        else { $share = Get-WmiObject Win32_Share | Where-Object {$_.Name -like 'ADMIN$'} }
+        $share = Get-CimInstance -ClassName Win32_Share | Where-Object {$_.Name -like 'ADMIN$'}
         #$shareClass = [WMICLASS]"WIN32_Share"  # Depreciated
 
         if ($share.Name -contains 'ADMIN$') {
@@ -2017,8 +2013,7 @@ Begin {
         }
         else { $fix = $true }
 
-        if ($PowerShellVersion -ge 6) { $share = Get-CimInstance Win32_Share | Where-Object {$_.Name -like 'C$'} }
-        else { $share = Get-WmiObject Win32_Share | Where-Object {$_.Name -like 'C$'} }
+        $share = Get-CimInstance -ClassName Win32_Share | Where-Object {$_.Name -like 'C$'}
         #$shareClass = [WMICLASS]'WIN32_Share'  # Depreciated
 
         if ($share.Name -contains "C$") {
@@ -2039,8 +2034,7 @@ Begin {
 
     Function Test-DiskSpace {
         $XMLDiskSpace = Get-XMLConfigOSDiskFreeSpace
-        if ($PowerShellVersion -ge 6) { $driveC = Get-CimInstance -Class Win32_LogicalDisk | Where-Object {$_.DeviceID -eq "$env:SystemDrive"} | Select-Object FreeSpace, Size }
-        else { $driveC = Get-WmiObject -Class Win32_LogicalDisk | Where-Object {$_.DeviceID -eq "$env:SystemDrive"} | Select-Object FreeSpace, Size }
+        $driveC = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object {$_.DeviceID -eq "$env:SystemDrive"} | Select-Object FreeSpace, Size
         $freeSpace = (($driveC.FreeSpace / $driveC.Size) * 100)
 
         if ($freeSpace -le $XMLDiskSpace) {
@@ -2056,7 +2050,7 @@ Begin {
 
     Function Test-CCMSoftwareDistribution {
         # TODO Implement this function
-        Get-WmiObject -Class CCM_SoftwareDistributionClientConfig
+        Get-CimInstance -ClassName CCM_SoftwareDistributionClientConfig
     }
 
     Function Get-UBR {
@@ -2073,12 +2067,11 @@ Begin {
         if ($execute -eq $true) {
 
             [float]$maxRebootDays = Get-XMLConfigMaxRebootDays
-            if ($PowerShellVersion -ge 6) { $wmi = Get-CimInstance Win32_OperatingSystem }
-            else { $wmi = Get-WmiObject Win32_OperatingSystem }
+            $wmi = Get-CimInstance -ClassName Win32_OperatingSystem
 
-            $lastBootTime = $wmi.ConvertToDateTime($wmi.LastBootUpTime)
+            $lastBootTime = $wmi.LastBootUpTime
 
-            $uptime = (Get-Date) - ($wmi.ConvertToDateTime($wmi.lastbootuptime))
+            $uptime = (Get-Date) - $wmi.LastBootUpTime
             if ($uptime.TotalDays -lt $maxRebootDays) {
                 $text = 'Last boot time: ' +$lastBootTime + ': OK'
                 Write-Output $text
@@ -2146,8 +2139,7 @@ Begin {
         Param([Parameter(Mandatory=$true)]$Log)
         $FileLogLevel = ((Get-XMLConfigLoggingLevel).ToString()).ToLower()
         $i = 0
-        if ($PowerShellVersion -ge 6) { $devices = Get-CimInstance Win32_PNPEntity | Where-Object{ ($_.ConfigManagerErrorCode -ne 0) -and ($_.ConfigManagerErrorCode -ne 22) -and ($_.Name -notlike "*PS/2*") } | Select-Object Name, DeviceID }
-        else { $devices = Get-WmiObject Win32_PNPEntity | Where-Object{ ($_.ConfigManagerErrorCode -ne 0) -and ($_.ConfigManagerErrorCode -ne 22) -and ($_.Name -notlike "*PS/2*") } | Select-Object Name, DeviceID }
+        $devices = Get-CimInstance -ClassName Win32_PNPEntity | Where-Object{ ($_.ConfigManagerErrorCode -ne 0) -and ($_.ConfigManagerErrorCode -ne 22) -and ($_.Name -notlike "*PS/2*") } | Select-Object Name, DeviceID
         $devices | ForEach-Object {$i++}
 
         if ($devices -ne $null) {
@@ -2194,8 +2186,7 @@ Begin {
 
         Write-Verbose "Start Test-SCCMHardwareInventoryScan"
         $days = Get-XMLConfigHardwareInventoryDays
-        if ($PowerShellVersion -ge 6) { $wmi = Get-CimInstance -Namespace root\ccm\invagt -Class InventoryActionStatus | Where-Object {$_.InventoryActionID -eq '{00000000-0000-0000-0000-000000000001}'} | Select-Object @{label='HWSCAN';expression={$_.ConvertToDateTime($_.LastCycleStartedDate)}} }
-        else { $wmi = Get-WmiObject -Namespace root\ccm\invagt -Class InventoryActionStatus | Where-Object {$_.InventoryActionID -eq '{00000000-0000-0000-0000-000000000001}'} | Select-Object @{label='HWSCAN';expression={$_.ConvertToDateTime($_.LastCycleStartedDate)}} }
+        $wmi = Get-CimInstance -Namespace root\ccm\invagt -ClassName InventoryActionStatus | Where-Object {$_.InventoryActionID -eq '{00000000-0000-0000-0000-000000000001}'} | Select-Object @{label='HWSCAN';expression={$_.LastCycleStartedDate}}
         $HWScanDate = $wmi | Select-Object -ExpandProperty HWSCAN
         $HWScanDate = Get-SmallDateTime $HWScanDate
         $minDate = Get-SmallDateTime((Get-Date).AddDays(-$days))
@@ -2204,11 +2195,10 @@ Begin {
             if ($fix -eq "true") {
                 $text = "ConfigMgr Hardware Inventory scan: $HWScanDate. Starting hardware inventory scan of the client."
                 Write-Host $Text
-                Get-SCCMPolicyHardwareInventory
+                Invoke-CCMTrigger -ScheduleID '{00000000-0000-0000-0000-000000000001}'
 
                 # Get the new date after policy trigger
-                if ($PowerShellVersion -ge 6) { $wmi = Get-CimInstance -Namespace root\ccm\invagt -Class InventoryActionStatus | Where-Object {$_.InventoryActionID -eq '{00000000-0000-0000-0000-000000000001}'} | Select-Object @{label='HWSCAN';expression={$_.ConvertToDateTime($_.LastCycleStartedDate)}} }
-                else { $wmi = Get-WmiObject -Namespace root\ccm\invagt -Class InventoryActionStatus | Where-Object {$_.InventoryActionID -eq '{00000000-0000-0000-0000-000000000001}'} | Select-Object @{label='HWSCAN';expression={$_.ConvertToDateTime($_.LastCycleStartedDate)}} }
+                $wmi = Get-CimInstance -Namespace root\ccm\invagt -ClassName InventoryActionStatus | Where-Object {$_.InventoryActionID -eq '{00000000-0000-0000-0000-000000000001}'} | Select-Object @{label='HWSCAN';expression={$_.LastCycleStartedDate}}
                 $HWScanDate = $wmi | Select-Object -ExpandProperty HWSCAN
                 $HWScanDate = Get-SmallDateTime -Date $HWScanDate
             }
@@ -2231,12 +2221,11 @@ Begin {
     Function Test-PolicyPlatform {
         Param([Parameter(Mandatory=$true)]$Log)
         try {
-            if (Get-WmiObject -Namespace 'root/Microsoft' -Class '__Namespace' -Filter 'Name = "PolicyPlatform"') { Write-Host "PolicyPlatform: OK" }
+            if (Get-CimInstance -Namespace 'root/Microsoft' -ClassName '__Namespace' -Filter 'Name = "PolicyPlatform"') { Write-Host "PolicyPlatform: OK" }
             else {
                 Write-Warning "PolicyPlatform: Not found, recompiling WMI 'Microsoft Policy Platform\ExtendedStatus.mof'"
 
-                if ($PowerShellVersion -ge 6) { $OS = Get-CimInstance Win32_OperatingSystem }
-                else { $OS = Get-WmiObject Win32_OperatingSystem }
+                $OS = Get-CimInstance -ClassName Win32_OperatingSystem
 
                 # 32 or 64?
                 if ($OS.OSArchitecture -match '64') { & mofcomp "$env:ProgramW6432\Microsoft Policy Platform\ExtendedStatus.mof" }
@@ -2255,8 +2244,7 @@ Begin {
     # Get the clients SiteName in Active Directory
     Function Get-ClientSiteName {
         try {
-            if ($PowerShellVersion -ge 6) { $obj = (Get-CimInstance Win32_NTDomain).ClientSiteName }
-            else { $obj = (Get-WmiObject Win32_NTDomain).ClientSiteName }
+            $obj = (Get-CimInstance -ClassName Win32_NTDomain).ClientSiteName
         }
         catch {$obj = $false}
         finally { if ($obj -ne $false) { Write-Output ($obj | Select-Object -First 1) } }
@@ -2319,35 +2307,10 @@ Begin {
         # Function to test and fix errors that prevent a computer to perform a HW scan. Not sure if this is really needed or not.
     }
 
-    # SCCM Client evaluation policies
-    Function Get-SCCMPolicySourceUpdateMessage {
-        $trigger = "{00000000-0000-0000-0000-000000000032}"
-        if ($PowerShellVersion -ge 6) { Invoke-CimMethod -Namespace 'root\ccm' -ClassName 'sms_client' -MethodName TriggerSchedule -Arguments @{sScheduleID=$trigger} -ErrorAction SilentlyContinue | Out-Null }
-        else { Invoke-WmiMethod -Namespace 'root\ccm' -Class 'sms_client' -Name TriggerSchedule -ArgumentList @($trigger) -ErrorAction SilentlyContinue | Out-Null }
-    }
-
-    Function Get-SCCMPolicySendUnsentStateMessages {
-        $trigger = "{00000000-0000-0000-0000-000000000111}"
-        if ($PowerShellVersion -ge 6) { Invoke-CimMethod -Namespace 'root\ccm' -ClassName 'sms_client' -MethodName TriggerSchedule -Arguments @{sScheduleID=$trigger} -ErrorAction SilentlyContinue | Out-Null }
-        else { Invoke-WmiMethod -Namespace 'root\ccm' -Class 'sms_client' -Name TriggerSchedule -ArgumentList @($trigger) -ErrorAction SilentlyContinue | Out-Null }
-    }
-
-    Function Get-SCCMPolicyScanUpdateSource {
-        $trigger = "{00000000-0000-0000-0000-000000000113}"
-        if ($PowerShellVersion -ge 6) { Invoke-CimMethod -Namespace 'root\ccm' -ClassName 'sms_client' -MethodName TriggerSchedule -Arguments @{sScheduleID=$trigger} -ErrorAction SilentlyContinue | Out-Null }
-        else { Invoke-WmiMethod -Namespace 'root\ccm' -Class 'sms_client' -Name TriggerSchedule -ArgumentList @($trigger) -ErrorAction SilentlyContinue | Out-Null }
-    }
-
-    Function Get-SCCMPolicyHardwareInventory {
-        $trigger = "{00000000-0000-0000-0000-000000000001}"
-        if ($PowerShellVersion -ge 6) { Invoke-CimMethod -Namespace 'root\ccm' -ClassName 'sms_client' -MethodName TriggerSchedule -Arguments @{sScheduleID=$trigger} -ErrorAction SilentlyContinue | Out-Null }
-        else { Invoke-WmiMethod -Namespace 'root\ccm' -Class 'sms_client' -Name TriggerSchedule -ArgumentList @($trigger) -ErrorAction SilentlyContinue | Out-Null }
-    }
-
-    Function Get-SCCMPolicyMachineEvaluation {
-        $trigger = "{00000000-0000-0000-0000-000000000022}"
-        if ($PowerShellVersion -ge 6) { Invoke-CimMethod -Namespace 'root\ccm' -ClassName 'sms_client' -MethodName TriggerSchedule -Arguments @{sScheduleID=$trigger} -ErrorAction SilentlyContinue | Out-Null }
-        else { Invoke-WmiMethod -Namespace 'root\ccm' -Class 'sms_client' -Name TriggerSchedule -ArgumentList @($trigger) -ErrorAction SilentlyContinue | Out-Null }
+    # SCCM Client evaluation policies - consolidated trigger function
+    Function Invoke-CCMTrigger {
+        Param([Parameter(Mandatory=$true)][string]$ScheduleID)
+        Invoke-CimMethod -Namespace 'root\ccm' -ClassName 'sms_client' -MethodName 'TriggerSchedule' -Arguments @{sScheduleID = $ScheduleID} -ErrorAction SilentlyContinue | Out-Null
     }
 
     Function Get-Version {
@@ -2434,7 +2397,7 @@ Begin {
         finally {Write-Output $obj }
     }
 
-    # Invoke-SqlCmd2 - Created by Chad Miller
+    # Invoke-SqlCmd2 - Originally by Chad Miller, modified to support SqlParameters
     function Invoke-Sqlcmd2 {
         [CmdletBinding()]
         param(
@@ -2446,7 +2409,8 @@ Begin {
         [Parameter(Position=5, Mandatory=$false)] [Int32]$QueryTimeout=600,
         [Parameter(Position=6, Mandatory=$false)] [Int32]$ConnectionTimeout=15,
         [Parameter(Position=7, Mandatory=$false)] [ValidateScript({test-path $_})] [string]$InputFile,
-        [Parameter(Position=8, Mandatory=$false)] [ValidateSet("DataSet", "DataTable", "DataRow")] [string]$As="DataRow"
+        [Parameter(Position=8, Mandatory=$false)] [ValidateSet("DataSet", "DataTable", "DataRow")] [string]$As="DataRow",
+        [Parameter(Mandatory=$false)] [System.Data.SqlClient.SqlParameter[]]$SqlParameters
         )
 
         if ($InputFile)
@@ -2473,6 +2437,7 @@ Begin {
         $conn.Open()
         $cmd=new-object system.Data.SqlClient.SqlCommand($Query,$conn)
         $cmd.CommandTimeout=$QueryTimeout
+        if ($SqlParameters) { $SqlParameters | ForEach-Object { [void]$cmd.Parameters.Add($_) } }
         $ds=New-Object system.Data.DataSet
         $da=New-Object system.Data.SqlClient.SqlDataAdapter($cmd)
         [void]$da.fill($ds)
@@ -2488,18 +2453,10 @@ Begin {
 
     # Gather info about the computer
     Function Get-Info {
-        if ($PowerShellVersion -ge 6) {
-            $OS = Get-CimInstance Win32_OperatingSystem
-            $ComputerSystem = Get-CimInstance Win32_ComputerSystem
-            if ($ComputerSystem.Manufacturer -like 'Lenovo') { $Model = (Get-CimInstance Win32_ComputerSystemProduct).Version }
-            else { $Model = $ComputerSystem.Model }
-        }
-        else {
-            $OS = Get-WmiObject Win32_OperatingSystem
-            $ComputerSystem = Get-WmiObject Win32_ComputerSystem
-            if ($ComputerSystem.Manufacturer -like 'Lenovo') { $Model = (Get-WmiObject Win32_ComputerSystemProduct).Version }
-            else { $Model = $ComputerSystem.Model }
-        }
+        $OS = Get-CimInstance -ClassName Win32_OperatingSystem
+        $ComputerSystem = Get-CimInstance -ClassName Win32_ComputerSystem
+        if ($ComputerSystem.Manufacturer -like 'Lenovo') { $Model = (Get-CimInstance -ClassName Win32_ComputerSystemProduct).Version }
+        else { $Model = $ComputerSystem.Model }
 
         $obj = New-Object PSObject -Property @{
             Hostname = $ComputerSystem.Name;
@@ -2508,7 +2465,7 @@ Begin {
             Operatingsystem = $OS.Caption;
             Architecture = $OS.OSArchitecture;
             Build = $OS.BuildNumber;
-            InstallDate = Get-SmallDateTime -Date ($OS.ConvertToDateTime($OS.InstallDate))
+            InstallDate = Get-SmallDateTime -Date ($OS.InstallDate)
             LastLoggedOnUser = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI\').LastLoggedOnUser;
         }
 
@@ -2968,18 +2925,10 @@ Begin {
     Function New-LogObject {
        # Write-Verbose "Start New-LogObject"
 
-        if ($PowerShellVersion -ge 6) {
-            $OS = Get-CimInstance -class Win32_OperatingSystem
-            $CS = Get-CimInstance -class Win32_ComputerSystem
-            if ($CS.Manufacturer -like 'Lenovo') { $Model = (Get-CimInstance Win32_ComputerSystemProduct).Version }
-            else { $Model = $CS.Model }
-        }
-        else {
-            $OS = Get-WmiObject -class Win32_OperatingSystem
-            $CS = Get-WmiObject -class Win32_ComputerSystem
-            if ($CS.Manufacturer -like 'Lenovo') { $Model = (Get-WmiObject Win32_ComputerSystemProduct).Version }
-            else { $Model = $CS.Model }
-        }
+        $OS = Get-CimInstance -ClassName Win32_OperatingSystem
+        $CS = Get-CimInstance -ClassName Win32_ComputerSystem
+        if ($CS.Manufacturer -like 'Lenovo') { $Model = (Get-CimInstance -ClassName Win32_ComputerSystemProduct).Version }
+        else { $Model = $CS.Model }
 
         # Handles different OS languages
         $Hostname = Get-Hostname
@@ -2992,8 +2941,7 @@ Begin {
         $Domain = Get-Domain
         [int]$MaxLogSize = 0
         $MaxLogHistory = 0
-        if ($PowerShellVersion -ge 6) { $InstallDate = Get-SmallDateTime -Date ($OS.InstallDate) }
-        else { $InstallDate = Get-SmallDateTime -Date ($OS.ConvertToDateTime($OS.InstallDate)) }
+        $InstallDate = Get-SmallDateTime -Date ($OS.InstallDate)
         $InstallDate = $InstallDate -replace '\.', ':'
         $LastLoggedOnUser = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI\').LastLoggedOnUser
         $CacheSize = Get-ClientCache
@@ -3004,8 +2952,7 @@ Begin {
         $ClientCertificate = 'Unknown'
         $PendingReboot = 'Unknown'
         $RebootApp = 'Unknown'
-        if ($PowerShellVersion -ge 6) { $LastBootTime = Get-SmallDateTime -Date ($OS.LastBootUpTime) }
-        else { $LastBootTime = Get-SmallDateTime -Date ($OS.ConvertToDateTime($OS.LastBootUpTime)) }
+        $LastBootTime = Get-SmallDateTime -Date ($OS.LastBootUpTime)
         $LastBootTime = $LastBootTime -replace '\.', ':'
         $OSDiskFreeSpace = Get-OSDiskFreeSpace
         $AdminShare = 'Unknown'
@@ -3110,54 +3057,110 @@ Begin {
         $table = 'dbo.Clients'
         $smallDateTime = Get-SmallDateTime
 
-        if ($null -ne $log.OSUpdates) {
-            # UPDATE
-            $q1 = "OSUpdates='"+$log.OSUpdates+"', "
-            # INSERT INTO
-            $q2 = "OSUpdates, "
-            # VALUES
-            $q3 = "'"+$log.OSUpdates+"', "
-        }
-        else {
-            $q1 = $null
-            $q2 = $null
-            $q3 = $null
+        # Helper to create SqlParameter with DBNull handling
+        Function New-SqlParam {
+            Param([string]$Name, $Value)
+            $p = New-Object System.Data.SqlClient.SqlParameter($Name, [System.Data.SqlDbType]::NVarChar)
+            if ($null -eq $Value -or $Value -eq '') { $p.Value = [DBNull]::Value }
+            else { $p.Value = [string]$Value }
+            return $p
         }
 
-        if ($null -ne $log.ClientInstalled) {
-            # UPDATE
-            $q10 = "ClientInstalled='"+$log.ClientInstalled+"', "
-            # INSERT INTO
-            $q20 = "ClientInstalled, "
-            # VALUES
-            $q30 = "'"+$log.ClientInstalled+"', "
-        }
-        else {
-            $q10 = $null
-            $q20 = $null
-            $q30 = $null
-        }
+        $query = "BEGIN TRAN
+        IF EXISTS (SELECT 1 FROM $table WITH (UPDLOCK,SERIALIZABLE) WHERE Hostname = @Hostname)
+        BEGIN
+            UPDATE $table SET
+                Operatingsystem = @Operatingsystem, Architecture = @Architecture, Build = @Build,
+                Manufacturer = @Manufacturer, Model = @Model, InstallDate = @InstallDate,
+                OSUpdates = @OSUpdates, LastLoggedOnUser = @LastLoggedOnUser,
+                ClientVersion = @ClientVersion, PSVersion = @PSVersion, PSBuild = @PSBuild,
+                Sitecode = @Sitecode, Domain = @Domain, MaxLogSize = @MaxLogSize,
+                MaxLogHistory = @MaxLogHistory, CacheSize = @CacheSize,
+                ClientCertificate = @ClientCertificate, ProvisioningMode = @ProvisioningMode,
+                DNS = @DNS, Drivers = @Drivers, Updates = @Updates,
+                PendingReboot = @PendingReboot, LastBootTime = @LastBootTime,
+                OSDiskFreeSpace = @OSDiskFreeSpace, Services = @Services,
+                AdminShare = @AdminShare, StateMessages = @StateMessages,
+                WUAHandler = @WUAHandler, WMI = @WMI,
+                RefreshComplianceState = @RefreshComplianceState, HWInventory = @HWInventory,
+                Version = @Version, ClientInstalled = @ClientInstalled,
+                Timestamp = @Timestamp, SWMetering = @SWMetering, BITS = @BITS,
+                PatchLevel = @PatchLevel, ClientInstalledReason = @ClientInstalledReason
+            WHERE Hostname = @Hostname
+        END
+        ELSE
+        BEGIN
+            INSERT INTO $table (
+                Hostname, Operatingsystem, Architecture, Build, Manufacturer, Model,
+                InstallDate, OSUpdates, LastLoggedOnUser, ClientVersion, PSVersion, PSBuild,
+                Sitecode, Domain, MaxLogSize, MaxLogHistory, CacheSize, ClientCertificate,
+                ProvisioningMode, DNS, Drivers, Updates, PendingReboot, LastBootTime,
+                OSDiskFreeSpace, Services, AdminShare, StateMessages, WUAHandler, WMI,
+                RefreshComplianceState, HWInventory, Version, ClientInstalled, Timestamp,
+                SWMetering, BITS, PatchLevel, ClientInstalledReason
+            ) VALUES (
+                @Hostname, @Operatingsystem, @Architecture, @Build, @Manufacturer, @Model,
+                @InstallDate, @OSUpdates, @LastLoggedOnUser, @ClientVersion, @PSVersion, @PSBuild,
+                @Sitecode, @Domain, @MaxLogSize, @MaxLogHistory, @CacheSize, @ClientCertificate,
+                @ProvisioningMode, @DNS, @Drivers, @Updates, @PendingReboot, @LastBootTime,
+                @OSDiskFreeSpace, @Services, @AdminShare, @StateMessages, @WUAHandler, @WMI,
+                @RefreshComplianceState, @HWInventory, @Version, @ClientInstalled, @Timestamp,
+                @SWMetering, @BITS, @PatchLevel, @ClientInstalledReason
+            )
+        END
+        COMMIT TRAN"
 
-		#ADD ClientSettings.log...
-        $query= "begin tran
-        if exists (SELECT * FROM $table WITH (updlock,serializable) WHERE Hostname='"+$log.Hostname+"')
-        begin
-            UPDATE $table SET Operatingsystem='"+$log.Operatingsystem+"', Architecture='"+$log.Architecture+"', Build='"+$log.Build+"', Manufacturer='"+$log.Manufacturer+"', Model='"+$log.Model+"', InstallDate='"+$log.InstallDate+"', $q1 LastLoggedOnUser='"+$log.LastLoggedOnUser+"', ClientVersion='"+$log.ClientVersion+"', PSVersion='"+$log.PSVersion+"', PSBuild='"+$log.PSBuild+"', Sitecode='"+$log.Sitecode+"', Domain='"+$log.Domain+"', MaxLogSize='"+$log.MaxLogSize+"', MaxLogHistory='"+$log.MaxLogHistory+"', CacheSize='"+$log.CacheSize+"', ClientCertificate='"+$log.ClientCertificate+"', ProvisioningMode='"+$log.ProvisioningMode+"', DNS='"+$log.DNS+"', Drivers='"+$log.Drivers+"', Updates='"+$log.Updates+"', PendingReboot='"+$log.PendingReboot+"', LastBootTime='"+$log.LastBootTime+"', OSDiskFreeSpace='"+$log.OSDiskFreeSpace+"', Services='"+$log.Services+"', AdminShare='"+$log.AdminShare+"', StateMessages='"+$log.StateMessages+"', WUAHandler='"+$log.WUAHandler+"', WMI='"+$log.WMI+"', RefreshComplianceState='"+$log.RefreshComplianceState+"', HWInventory='"+$log.HWInventory+"', Version='"+$Version+"', $q10 Timestamp='"+$smallDateTime+"', SWMetering='"+$log.SWMetering+"', BITS='"+$log.BITS+"', PatchLevel='"+$Log.PatchLevel+"', ClientInstalledReason='"+$log.ClientInstalledReason+"'
-            WHERE Hostname = '"+$log.Hostname+"'
-        end
-        else
-        begin
-            INSERT INTO $table (Hostname, Operatingsystem, Architecture, Build, Manufacturer, Model, InstallDate, $q2 LastLoggedOnUser, ClientVersion, PSVersion, PSBuild, Sitecode, Domain, MaxLogSize, MaxLogHistory, CacheSize, ClientCertificate, ProvisioningMode, DNS, Drivers, Updates, PendingReboot, LastBootTime, OSDiskFreeSpace, Services, AdminShare, StateMessages, WUAHandler, WMI, RefreshComplianceState, HWInventory, Version, $q20 Timestamp, SWMetering, BITS, PatchLevel, ClientInstalledReason)
-            VALUES ('"+$log.Hostname+"', '"+$log.Operatingsystem+"', '"+$log.Architecture+"', '"+$log.Build+"', '"+$log.Manufacturer+"', '"+$log.Model+"', '"+$log.InstallDate+"', $q3 '"+$log.LastLoggedOnUser+"', '"+$log.ClientVersion+"', '"+$log.PSVersion+"', '"+$log.PSBuild+"', '"+$log.Sitecode+"', '"+$log.Domain+"', '"+$log.MaxLogSize+"', '"+$log.MaxLogHistory+"', '"+$log.CacheSize+"', '"+$log.ClientCertificate+"', '"+$log.ProvisioningMode+"', '"+$log.DNS+"', '"+$log.Drivers+"', '"+$log.Updates+"', '"+$log.PendingReboot+"', '"+$log.LastBootTime+"', '"+$log.OSDiskFreeSpace+"', '"+$log.Services+"', '"+$log.AdminShare+"', '"+$log.StateMessages+"', '"+$log.WUAHandler+"', '"+$log.WMI+"', '"+$log.RefreshComplianceState+"', '"+$log.HWInventory+"', '"+$log.Version+"', $q30 '"+$smallDateTime+"', '"+$log.SWMetering+"', '"+$log.BITS+"', '"+$Log.PatchLevel+"', '"+$Log.ClientInstalledReason+"')
-        end
-        commit tran"
+        $sqlParams = @(
+            (New-SqlParam '@Hostname'               $log.Hostname)
+            (New-SqlParam '@Operatingsystem'        $log.Operatingsystem)
+            (New-SqlParam '@Architecture'            $log.Architecture)
+            (New-SqlParam '@Build'                   $log.Build)
+            (New-SqlParam '@Manufacturer'            $log.Manufacturer)
+            (New-SqlParam '@Model'                   $log.Model)
+            (New-SqlParam '@InstallDate'             $log.InstallDate)
+            (New-SqlParam '@OSUpdates'               $log.OSUpdates)
+            (New-SqlParam '@LastLoggedOnUser'        $log.LastLoggedOnUser)
+            (New-SqlParam '@ClientVersion'           $log.ClientVersion)
+            (New-SqlParam '@PSVersion'               $log.PSVersion)
+            (New-SqlParam '@PSBuild'                 $log.PSBuild)
+            (New-SqlParam '@Sitecode'                $log.Sitecode)
+            (New-SqlParam '@Domain'                  $log.Domain)
+            (New-SqlParam '@MaxLogSize'              $log.MaxLogSize)
+            (New-SqlParam '@MaxLogHistory'            $log.MaxLogHistory)
+            (New-SqlParam '@CacheSize'               $log.CacheSize)
+            (New-SqlParam '@ClientCertificate'       $log.ClientCertificate)
+            (New-SqlParam '@ProvisioningMode'        $log.ProvisioningMode)
+            (New-SqlParam '@DNS'                     $log.DNS)
+            (New-SqlParam '@Drivers'                 $log.Drivers)
+            (New-SqlParam '@Updates'                 $log.Updates)
+            (New-SqlParam '@PendingReboot'           $log.PendingReboot)
+            (New-SqlParam '@LastBootTime'            $log.LastBootTime)
+            (New-SqlParam '@OSDiskFreeSpace'         $log.OSDiskFreeSpace)
+            (New-SqlParam '@Services'                $log.Services)
+            (New-SqlParam '@AdminShare'              $log.AdminShare)
+            (New-SqlParam '@StateMessages'           $log.StateMessages)
+            (New-SqlParam '@WUAHandler'              $log.WUAHandler)
+            (New-SqlParam '@WMI'                     $log.WMI)
+            (New-SqlParam '@RefreshComplianceState'  $log.RefreshComplianceState)
+            (New-SqlParam '@HWInventory'             $log.HWInventory)
+            (New-SqlParam '@Version'                 $Version)
+            (New-SqlParam '@ClientInstalled'         $log.ClientInstalled)
+            (New-SqlParam '@Timestamp'               $smallDateTime)
+            (New-SqlParam '@SWMetering'              $log.SWMetering)
+            (New-SqlParam '@BITS'                    $log.BITS)
+            (New-SqlParam '@PatchLevel'              $log.PatchLevel)
+            (New-SqlParam '@ClientInstalledReason'   $log.ClientInstalledReason)
+        )
 
-        try { Invoke-SqlCmd2 -ServerInstance $SQLServer -Database $Database -Query $query }
+        try {
+            Invoke-WithRetry -OperationName 'SQL Update' -ScriptBlock {
+                Invoke-Sqlcmd2 -ServerInstance $SQLServer -Database $Database -Query $query -SqlParameters $sqlParams
+            }
+        }
         catch {
             $ErrorMessage = $_.Exception.Message
-            $text = "Error updating SQL with the following query: $query. Error: $ErrorMessage"
-            Write-Error $text
-            Out-LogFile -Xml $Xml -Text "ERROR Insert/Update SQL. SQL Query: $query `nSQL Error: $ErrorMessage" -Severity 3
+            Write-Error "Error updating SQL after retries: $ErrorMessage"
+            Out-LogFile -Xml $Xml -Text "ERROR Insert/Update SQL: $ErrorMessage" -Severity 3
         }
         Write-Verbose "End Update-SQL"
     }
@@ -3190,6 +3193,32 @@ Begin {
     # Write-Log : CMTrace compatible log file
 
 
+    # Validate config values to prevent injection via WMI filters and paths
+    Function Test-ConfigValues {
+        Param([Parameter(Mandatory=$true)]$Xml)
+
+        # Validate service names (used in WMI filters)
+        foreach ($svc in $Xml.Configuration.Service) {
+            if ($svc.Name -notmatch '^[a-zA-Z0-9_\-\.]+$') {
+                throw "Invalid service name in config: '$($svc.Name)'. Only alphanumeric, underscore, hyphen, and dot are allowed."
+            }
+        }
+
+        # Validate site code
+        $siteCode = Get-XMLConfigClientSitecode
+        if ($siteCode -and $siteCode -notmatch '^[A-Za-z0-9]{3}$') {
+            throw "Invalid site code in config: '$siteCode'. Must be exactly 3 alphanumeric characters."
+        }
+
+        # Validate domain
+        $domain = Get-XMLConfigClientDomain
+        if ($domain -and $domain -notmatch '^[a-zA-Z0-9\.\-]+$') {
+            throw "Invalid domain in config: '$domain'. Contains unexpected characters."
+        }
+
+        Write-Verbose "Config validation passed"
+    }
+
     #endregion
 
     # Set default restart values to false
@@ -3201,6 +3230,9 @@ Begin {
     # If config.xml is used
     if ($Config) {
 
+        # Validate config inputs before use
+        Test-ConfigValues -Xml $Xml
+
         # Build the ConfigMgr Client Install Property string
         $propertyString = ""
         foreach ($property in $Xml.Configuration.ClientInstallProperty) {
@@ -3208,8 +3240,7 @@ Begin {
             $propertyString = $propertyString + ' '
         }
         $clientCacheSize = Get-XMLConfigClientCache
-        #replace to account for multiple skipreqs and escapee the character
-        $clientInstallProperties = $propertyString.Replace(';', '`;')
+        $clientInstallProperties = $propertyString
         $clientAutoUpgrade = (Get-XMLConfigClientAutoUpgrade).ToLower()
         $AdminShare = Get-XMLConfigRemediationAdminShare
         $ClientProvisioningMode = Get-XMLConfigRemediationClientProvisioningMode
@@ -3411,15 +3442,15 @@ Process {
     Write-Verbose 'Getting install date of last OS patch for SQL log'
     Get-LastInstalledPatches -Log $log
     Write-Verbose 'Sending unsent state messages if any'
-    Get-SCCMPolicySendUnsentStateMessages
+    Invoke-CCMTrigger -ScheduleID '{00000000-0000-0000-0000-000000000111}'
     Write-Verbose 'Getting Source Update Message policy and policy to trigger scan update source'
 
     if ($newinstall -eq $false) {
-        Get-SCCMPolicySourceUpdateMessage
-        Get-SCCMPolicyScanUpdateSource
-        Get-SCCMPolicySendUnsentStateMessages
+        Invoke-CCMTrigger -ScheduleID '{00000000-0000-0000-0000-000000000032}'
+        Invoke-CCMTrigger -ScheduleID '{00000000-0000-0000-0000-000000000113}'
+        Invoke-CCMTrigger -ScheduleID '{00000000-0000-0000-0000-000000000111}'
     }
-    Get-SCCMPolicyMachineEvaluation
+    Invoke-CCMTrigger -ScheduleID '{00000000-0000-0000-0000-000000000022}'
 
     # Restart ConfigMgr client if tagged for restart and no reinstall tag
     if (($restartCCMExec -eq $true) -and ($Reinstall -eq $false)) {
