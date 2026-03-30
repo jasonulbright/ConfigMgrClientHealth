@@ -1,0 +1,91 @@
+{
+    "LocalFiles": "C:\\ClientHealth",
+    "Client": {
+        "Version": "5.00.9012.1010",
+        "SiteCode": "AR1",
+        "Domain": "andersrodland.com",
+        "AutoUpgrade": true,
+        "Share": "",
+        "Cache": {
+            "Size": 16384,
+            "DeleteOrphanedData": true,
+            "Enable": true
+        },
+        "Log": {
+            "MaxSize": 4096,
+            "MaxHistory": 2,
+            "Enable": true
+        }
+    },
+    "ClientInstallProperties": [
+        "SMSSITECODE=AR1",
+        "MP=MEMCM01.andersrodland.com",
+        "FSP=MEMCM01.andersrodland.com",
+        "DNSSUFFIX=andersrodland.com",
+        "/Source:\\\\MEMCM01.andersrodland.com\\Clienthealth$\\client",
+        "/MP:MEMCM01.andersrodland.com",
+        "/skipprereq:silverlight.exe"
+    ],
+    "Logging": {
+        "Share": "\\\\MEMCM01.andersrodland.com\\ClientHealthLogs$",
+        "Level": "Full",
+        "MaxHistory": 8,
+        "LocalLogFile": true,
+        "FileEnabled": true,
+        "TimeFormat": "ClientLocal",
+        "SQL": {
+            "Server": "MEMCM01.andersrodland.com",
+            "Enabled": true
+        }
+    },
+    "Options": {
+        "CcmSQLCELog": false,
+        "BITSCheck": { "Enable": true, "Fix": true },
+        "ClientSettingsCheck": { "Enable": true, "Fix": true },
+        "DNSCheck": { "Enable": true, "Fix": true },
+        "Drivers": true,
+        "PatchLevel": true,
+        "Updates": {
+            "Share": "",
+            "Enable": false,
+            "Fix": true
+        },
+        "PendingReboot": {
+            "Enable": true,
+            "StartRebootApplication": false
+        },
+        "RebootApplication": {
+            "Enable": false,
+            "Application": ""
+        },
+        "MaxRebootDays": 7,
+        "OSDiskFreeSpace": 10,
+        "HardwareInventory": {
+            "Enable": true,
+            "Fix": true,
+            "Days": 10
+        },
+        "SoftwareMetering": { "Enable": true, "Fix": true },
+        "WMI": { "Enable": true, "Fix": true },
+        "RefreshComplianceState": { "Enable": true, "Days": 30 }
+    },
+    "Services": [
+        { "Name": "BITS",          "StartupType": "Automatic (Delayed Start)", "State": "Running", "Uptime": "" },
+        { "Name": "winmgmt",       "StartupType": "Automatic",                 "State": "Running", "Uptime": "" },
+        { "Name": "wuauserv",      "StartupType": "Automatic (Delayed Start)", "State": "Running", "Uptime": "" },
+        { "Name": "lanmanserver",  "StartupType": "Automatic",                 "State": "Running", "Uptime": "" },
+        { "Name": "RpcSs",         "StartupType": "Automatic",                 "State": "Running", "Uptime": "" },
+        { "Name": "W32Time",       "StartupType": "Automatic",                 "State": "Running", "Uptime": "" },
+        { "Name": "ccmexec",       "StartupType": "Automatic (Delayed Start)", "State": "Running", "Uptime": "" }
+    ],
+    "Remediation": {
+        "AdminShare": true,
+        "ClientProvisioningMode": true,
+        "ClientStateMessages": true,
+        "ClientWUAHandler": { "Fix": true, "Days": 30 },
+        "ClientCertificate": true
+    },
+    "Sites": {
+        "Default": {}
+    }
+}

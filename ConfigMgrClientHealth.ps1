@@ -43,7 +43,7 @@
 param(
     [Parameter(HelpMessage='Path to XML Configuration File')]
     [ValidateScript({Test-Path -Path $_ -PathType Leaf})]
-    [ValidatePattern('.xml$')]
+    [ValidatePattern('\.(xml|json)$')]
     [string]$Config,
     [Parameter(HelpMessage='URI to ConfigMgr Client Health Webservice')]
     [string]$Webservice
@@ -52,11 +52,19 @@ param(
 Begin {
     # ConfigMgr Client Health Version
     $Version = '0.8.3'
+    $script:JsonConfig = $null
     $global:ScriptPath = split-path -parent $MyInvocation.MyCommand.Definition
 
     #If no config file was passed in, use the default.
     If ((!$PSBoundParameters.ContainsKey('Config')) -and (!$PSBoundParameters.ContainsKey('Webservice'))) {
-        $Config = Join-Path ($global:ScriptPath) "Config.xml"
+        # Prefer config.json if it exists, otherwise fall back to Config.xml
+        $jsonDefault = Join-Path ($global:ScriptPath) "config.json"
+        $xmlDefault = Join-Path ($global:ScriptPath) "Config.xml"
+        if (Test-Path $jsonDefault) {
+            $Config = $jsonDefault
+        } else {
+            $Config = $xmlDefault
+        }
         Write-Verbose "No config provided, defaulting to $Config"
     }
 
@@ -103,19 +111,58 @@ Begin {
         }
     }
 
-    # Read configuration from XML file
+    # Read configuration from file (JSON or XML)
+    $ConfigCachePath = Join-Path $env:ProgramData 'ConfigMgrClientHealth\config.json.cache'
+
     if ($config) {
         if (Test-Path $Config) {
-            # Test if valid XML
-            if ((Test-XML -xmlFilePath $Config) -ne $true ) { Exit 1 }
+            if ($Config -match '\.json$') {
+                # Load JSON config
+                Try {
+                    $configRaw = Get-Content -Path $Config -Raw
+                    $script:JsonConfig = $configRaw | ConvertFrom-Json
+                    Write-Verbose "JSON configuration loaded from $Config"
 
-            # Load XML file into variable
-            Try { $Xml = [xml](Get-Content -Path $Config) }
-            Catch {
-                $ErrorMessage = $_.Exception.Message
-                $text = "Error, could not read $Config. Check file location and share/ntfs permissions. Is XML config file damaged?"
-                $text += "`nError message: $ErrorMessage"
-                Write-Error $text
+                    # Cache a local copy for offline use
+                    try {
+                        $cacheDir = Split-Path $ConfigCachePath -Parent
+                        if (-not (Test-Path $cacheDir)) { New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null }
+                        $configRaw | Set-Content -Path $ConfigCachePath -Force -Encoding UTF8
+                        Write-Verbose "Config cached to $ConfigCachePath"
+                    }
+                    catch { Write-Verbose "Could not cache config: $_" }
+                }
+                Catch {
+                    $ErrorMessage = $_.Exception.Message
+                    $text = "Error, could not read $Config. Check file location and share/ntfs permissions. Is JSON config file damaged?"
+                    $text += "`nError message: $ErrorMessage"
+                    Write-Error $text
+                    Exit 1
+                }
+            }
+            else {
+                # Test if valid XML
+                if ((Test-XML -xmlFilePath $Config) -ne $true ) { Exit 1 }
+
+                # Load XML file into variable
+                Try { $Xml = [xml](Get-Content -Path $Config) }
+                Catch {
+                    $ErrorMessage = $_.Exception.Message
+                    $text = "Error, could not read $Config. Check file location and share/ntfs permissions. Is XML config file damaged?"
+                    $text += "`nError message: $ErrorMessage"
+                    Write-Error $text
+                    Exit 1
+                }
+            }
+        }
+        elseif (($Config -match '\.json$') -and (Test-Path $ConfigCachePath)) {
+            # Network config unreachable — fall back to cached copy
+            try {
+                $script:JsonConfig = Get-Content -Path $ConfigCachePath -Raw | ConvertFrom-Json
+                Write-Warning "Config file '$Config' not accessible. Using cached config from $ConfigCachePath"
+            }
+            catch {
+                Write-Error "Config file '$Config' not accessible and cached config is corrupt."
                 Exit 1
             }
         }
@@ -1799,15 +1846,23 @@ Begin {
 
         $log.Services = 'OK'
 
-        # Test services defined by config.xml
-        Write-Verbose 'Test services from XML configuration file'
-        foreach ($service in $Xml.Configuration.Service)
+        # Determine service list from JSON or XML config
+        if ($script:JsonConfig) {
+            Write-Verbose 'Test services from JSON configuration file'
+            $serviceList = $script:JsonConfig.Services
+        }
+        else {
+            Write-Verbose 'Test services from XML configuration file'
+            $serviceList = $Xml.Configuration.Service
+        }
+
+        foreach ($service in $serviceList)
         {
             $startuptype = ($service.StartupType).ToLower()
 
             if ($startuptype -like "automatic (delayed start)") { $service.StartupType = "automaticd" }
 
-            if ($service.uptime) {
+            if ($service.Uptime) {
                 $uptime = ($service.Uptime).ToLower()
                 Test-Service -Name $service.Name -StartupType $service.StartupType -State $service.State -Log $log -Uptime $uptime
             }
@@ -2250,6 +2305,38 @@ Begin {
         finally { if ($obj -ne $false) { Write-Output ($obj | Select-Object -First 1) } }
     }
 
+    # Resolve site-specific config overrides from the Sites section of config.json
+    Function Get-SiteConfig {
+        Param([string]$PropertyName)
+
+        if (-not $script:JsonConfig -or -not $script:JsonConfig.Sites) { return $null }
+
+        if (-not $script:ResolvedADSite) {
+            $script:ResolvedADSite = Get-ClientSiteName
+            if (-not $script:ResolvedADSite) { $script:ResolvedADSite = '_none_' }
+            Write-Verbose "AD Site resolved: $($script:ResolvedADSite)"
+        }
+
+        $sites = $script:JsonConfig.Sites
+        $adSite = $script:ResolvedADSite
+
+        # Try site-specific override first
+        if ($adSite -ne '_none_' -and $sites.PSObject.Properties[$adSite]) {
+            $siteObj = $sites.$adSite
+            if ($siteObj.PSObject.Properties[$PropertyName]) {
+                Write-Verbose "Site config: using $PropertyName from site '$adSite'"
+                return $siteObj.$PropertyName
+            }
+        }
+
+        # Fall back to Default
+        if ($sites.PSObject.Properties['Default'] -and $sites.Default.PSObject.Properties[$PropertyName]) {
+            return $sites.Default.$PropertyName
+        }
+
+        return $null
+    }
+
     Function Test-SoftwareMeteringPrepDriver {
         Param([Parameter(Mandatory=$true)]$Log)
         # To execute function: if (Test-SoftwareMeteringPrepDriver -eq $false) {$restartCCMExec = $true}
@@ -2484,22 +2571,23 @@ Begin {
     }
 
     Function Get-XMLConfigClientVersion {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Client.Version }
         if ($config) {
             $obj = $Xml.Configuration.Client | Where-Object {$_.Name -like 'Version'} | Select-Object -ExpandProperty '#text'
         }
-
         Write-Output $obj
     }
 
     Function Get-XMLConfigClientSitecode {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Client.SiteCode }
         if ($config) {
             $obj = $Xml.Configuration.Client | Where-Object {$_.Name -like 'SiteCode'} | Select-Object -ExpandProperty '#text'
         }
-
         Write-Output $obj
     }
 
     Function Get-XMLConfigClientDomain {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Client.Domain }
         if ($config) {
             $obj = $Xml.Configuration.Client | Where-Object {$_.Name -like 'Domain'} | Select-Object -ExpandProperty '#text'
         }
@@ -2507,6 +2595,7 @@ Begin {
     }
 
     Function Get-XMLConfigClientAutoUpgrade {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Client.AutoUpgrade }
         if ($config) {
             $obj = $Xml.Configuration.Client | Where-Object {$_.Name -like 'AutoUpgrade'} | Select-Object -ExpandProperty '#text'
         }
@@ -2514,6 +2603,7 @@ Begin {
     }
 
     Function Get-XMLConfigClientMaxLogSize {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Client.Log.MaxSize }
         if ($config) {
             $obj = $Xml.Configuration.Client | Where-Object {$_.Name -like 'Log'} | Select-Object -ExpandProperty 'MaxLogSize'
         }
@@ -2521,6 +2611,7 @@ Begin {
     }
 
     Function Get-XMLConfigClientMaxLogHistory {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Client.Log.MaxHistory }
         if ($config) {
             $obj = $Xml.Configuration.Client | Where-Object {$_.Name -like 'Log'} | Select-Object -ExpandProperty 'MaxLogHistory'
         }
@@ -2528,6 +2619,7 @@ Begin {
     }
 
     Function Get-XMLConfigClientMaxLogSizeEnabled {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Client.Log.Enable }
         if ($config) {
             $obj = $Xml.Configuration.Client | Where-Object {$_.Name -like 'Log'} | Select-Object -ExpandProperty 'Enable'
         }
@@ -2535,6 +2627,7 @@ Begin {
     }
 
     Function Get-XMLConfigClientCache {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Client.Cache.Size }
         if ($config) {
             $obj = $Xml.Configuration.Client | Where-Object {$_.Name -like 'CacheSize'} | Select-Object -ExpandProperty 'Value'
         }
@@ -2542,6 +2635,7 @@ Begin {
     }
 
     Function Get-XMLConfigClientCacheDeleteOrphanedData {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Client.Cache.DeleteOrphanedData }
         if ($config) {
             $obj = $Xml.Configuration.Client | Where-Object {$_.Name -like 'CacheSize'} | Select-Object -ExpandProperty 'DeleteOrphanedData'
         }
@@ -2549,6 +2643,7 @@ Begin {
     }
 
     Function Get-XMLConfigClientCacheEnable {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Client.Cache.Enable }
         if ($config) {
             $obj = $Xml.Configuration.Client | Where-Object {$_.Name -like 'CacheSize'} | Select-Object -ExpandProperty 'Enable'
         }
@@ -2556,24 +2651,35 @@ Begin {
     }
 
     Function Get-XMLConfigClientShare {
+        if ($script:JsonConfig) {
+            $siteOverride = Get-SiteConfig -PropertyName 'ClientShare'
+            if ($siteOverride) { return $siteOverride }
+            $obj = $script:JsonConfig.Client.Share
+            if (!$obj) { $obj = $global:ScriptPath }
+            return $obj
+        }
         if ($config) {
             $obj = $Xml.Configuration.Client | Where-Object {$_.Name -like 'Share'} | Select-Object -ExpandProperty '#text' -ErrorAction SilentlyContinue
         }
-
         if(!($obj)){$obj=$global:ScriptPath} #If Client share is empty, default to the script folder.
         Write-Output $obj
     }
 
     Function Get-XMLConfigUpdatesShare {
+        if ($script:JsonConfig) {
+            $obj = $script:JsonConfig.Options.Updates.Share
+            if (!$obj) { $obj = Join-Path $global:ScriptPath "Updates" }
+            return $obj
+        }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'Updates'} | Select-Object -ExpandProperty 'Share'
         }
-
         If (!($obj)){$obj = Join-Path $global:ScriptPath "Updates"}
         Return $obj
     }
 
     Function Get-XMLConfigUpdatesEnable {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.Updates.Enable }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'Updates'} | Select-Object -ExpandProperty 'Enable'
         }
@@ -2581,21 +2687,28 @@ Begin {
     }
 
     Function Get-XMLConfigUpdatesFix {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.Updates.Fix }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'Updates'} | Select-Object -ExpandProperty 'Fix' }
         Write-Output $obj
     }
 
     Function Get-XMLConfigLoggingShare {
+        if ($script:JsonConfig) {
+            $siteOverride = Get-SiteConfig -PropertyName 'LogShare'
+            $obj = if ($siteOverride) { $siteOverride } else { $script:JsonConfig.Logging.Share }
+            $obj = $ExecutionContext.InvokeCommand.ExpandString($obj)
+            return $obj
+        }
         if ($config) {
             $obj = $Xml.Configuration.Log | Where-Object {$_.Name -like 'File'} | Select-Object -ExpandProperty 'Share'
         }
-
         $obj = $ExecutionContext.InvokeCommand.ExpandString($obj)
         Return $obj
     }
 
     Function Get-XMLConfigLoggingLocalFile {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Logging.LocalLogFile }
         if ($config) {
             $obj = $Xml.Configuration.Log | Where-Object {$_.Name -like 'File'} | Select-Object -ExpandProperty 'LocalLogFile'
         }
@@ -2603,6 +2716,7 @@ Begin {
     }
 
     Function Get-XMLConfigLoggingEnable {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Logging.FileEnabled }
         if ($config) {
             $obj = $Xml.Configuration.Log | Where-Object {$_.Name -like 'File'} | Select-Object -ExpandProperty 'Enable'
         }
@@ -2611,6 +2725,7 @@ Begin {
 
     Function Get-XMLConfigLoggingMaxHistory {
         # Currently not configurable through console extension and webservice. TODO
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Logging.MaxHistory }
         if ($config) {
             $obj = $Xml.Configuration.Log | Where-Object {$_.Name -like 'File'} | Select-Object -ExpandProperty 'MaxLogHistory'
         }
@@ -2618,6 +2733,7 @@ Begin {
     }
 
     Function Get-XMLConfigLoggingLevel {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Logging.Level }
         if ($config) {
             $obj = $Xml.Configuration.Log | Where-Object {$_.Name -like 'File'} | Select-Object -ExpandProperty 'Level'
         }
@@ -2625,6 +2741,7 @@ Begin {
     }
 
     Function Get-XMLConfigLoggingTimeFormat {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Logging.TimeFormat }
         if ($config) {
             $obj = $Xml.Configuration.Log | Where-Object {$_.Name -like 'Time'} | Select-Object -ExpandProperty 'Format'
         }
@@ -2633,6 +2750,7 @@ Begin {
 
     Function Get-XMLConfigPendingRebootApp {
         # TODO verify this function
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.PendingReboot.StartRebootApplication }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'PendingReboot'} | Select-Object -ExpandProperty 'StartRebootApplication'
         }
@@ -2640,6 +2758,7 @@ Begin {
     }
 
     Function Get-XMLConfigMaxRebootDays {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.MaxRebootDays }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'MaxRebootDays'} | Select-Object -ExpandProperty 'Days'
         }
@@ -2647,6 +2766,7 @@ Begin {
     }
 
     Function Get-XMLConfigRebootApplication {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.RebootApplication.Application }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'RebootApplication'} | Select-Object -ExpandProperty 'Application'
         }
@@ -2655,6 +2775,7 @@ Begin {
 
     Function Get-XMLConfigRebootApplicationEnable {
         ### TODO implement in webservice
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.RebootApplication.Enable }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'RebootApplication'} | Select-Object -ExpandProperty 'Enable'
         }
@@ -2663,6 +2784,7 @@ Begin {
 
     Function Get-XMLConfigDNSCheck {
         # TODO verify switch, skip test and monitor for console extension
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.DNSCheck.Enable }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'DNSCheck'} | Select-Object -ExpandProperty 'Enable'
         }
@@ -2671,14 +2793,15 @@ Begin {
 
     Function Get-XMLConfigCcmSQLCELog {
         # TODO implement monitor mode
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.CcmSQLCELog }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'CcmSQLCELog'} | Select-Object -ExpandProperty 'Enable'
         }
-
         Write-Output $obj
     }
 
     Function Get-XMLConfigDNSFix {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.DNSCheck.Fix }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'DNSCheck'} | Select-Object -ExpandProperty 'Fix'
         }
@@ -2686,6 +2809,7 @@ Begin {
     }
 
     Function Get-XMLConfigDrivers {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.Drivers }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'Drivers'} | Select-Object -ExpandProperty 'Enable'
         }
@@ -2693,6 +2817,7 @@ Begin {
     }
 
     Function Get-XMLConfigPatchLevel {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.PatchLevel }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'PatchLevel'} | Select-Object -ExpandProperty 'Enable'
         }
@@ -2700,6 +2825,7 @@ Begin {
     }
 
     Function Get-XMLConfigOSDiskFreeSpace {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.OSDiskFreeSpace }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'OSDiskFreeSpace'} | Select-Object -ExpandProperty '#text'
         }
@@ -2707,6 +2833,7 @@ Begin {
     }
 
     Function Get-XMLConfigHardwareInventoryEnable {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.HardwareInventory.Enable }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'HardwareInventory'} | Select-Object -ExpandProperty 'Enable'
         }
@@ -2714,6 +2841,7 @@ Begin {
     }
 
     Function Get-XMLConfigHardwareInventoryFix {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.HardwareInventory.Fix }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'HardwareInventory'} | Select-Object -ExpandProperty 'Fix'
         }
@@ -2721,6 +2849,7 @@ Begin {
     }
 
     Function Get-XMLConfigSoftwareMeteringEnable {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.SoftwareMetering.Enable }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'SoftwareMetering'} | Select-Object -ExpandProperty 'Enable'
         }
@@ -2729,6 +2858,7 @@ Begin {
 
     Function Get-XMLConfigSoftwareMeteringFix {
         # TODO implement this check in console extension and webservice
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.SoftwareMetering.Fix }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'SoftwareMetering'} | Select-Object -ExpandProperty 'Fix'
         }
@@ -2737,6 +2867,7 @@ Begin {
 
     Function Get-XMLConfigHardwareInventoryDays {
         # TODO implement this check in console extension and webservice
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.HardwareInventory.Days }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'HardwareInventory'} | Select-Object -ExpandProperty 'Days'
         }
@@ -2744,6 +2875,7 @@ Begin {
     }
 
     Function Get-XMLConfigRemediationAdminShare {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Remediation.AdminShare }
         if ($config) {
             $obj = $Xml.Configuration.Remediation | Where-Object {$_.Name -like 'AdminShare'} | Select-Object -ExpandProperty 'Fix'
         }
@@ -2751,6 +2883,7 @@ Begin {
     }
 
     Function Get-XMLConfigRemediationClientProvisioningMode {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Remediation.ClientProvisioningMode }
         if ($config) {
             $obj = $Xml.Configuration.Remediation | Where-Object {$_.Name -like 'ClientProvisioningMode'} | Select-Object -ExpandProperty 'Fix'
         }
@@ -2758,6 +2891,7 @@ Begin {
     }
 
     Function Get-XMLConfigRemediationClientStateMessages {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Remediation.ClientStateMessages }
         if ($config) {
             $obj = $Xml.Configuration.Remediation | Where-Object {$_.Name -like 'ClientStateMessages'} | Select-Object -ExpandProperty 'Fix'
         }
@@ -2765,6 +2899,7 @@ Begin {
     }
 
     Function Get-XMLConfigRemediationClientWUAHandler {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Remediation.ClientWUAHandler.Fix }
         if ($config) {
             $obj = $Xml.Configuration.Remediation | Where-Object {$_.Name -like 'ClientWUAHandler'} | Select-Object -ExpandProperty 'Fix'
         }
@@ -2773,6 +2908,7 @@ Begin {
 
     Function Get-XMLConfigRemediationClientWUAHandlerDays {
         # TODO implement days in console extension and webservice
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Remediation.ClientWUAHandler.Days }
         if ($config) {
             $obj = $Xml.Configuration.Remediation | Where-Object {$_.Name -like 'ClientWUAHandler'} | Select-Object -ExpandProperty 'Days'
         }
@@ -2780,6 +2916,7 @@ Begin {
     }
 
     Function Get-XMLConfigBITSCheck {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.BITSCheck.Enable }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'BITSCheck'} | Select-Object -ExpandProperty 'Enable'
         }
@@ -2787,6 +2924,7 @@ Begin {
     }
 
     Function Get-XMLConfigBITSCheckFix {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.BITSCheck.Fix }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'BITSCheck'} | Select-Object -ExpandProperty 'Fix'
         }
@@ -2795,17 +2933,20 @@ Begin {
 
 	Function Get-XMLConfigClientSettingsCheck {
         # TODO implement in console extension and webservice
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.ClientSettingsCheck.Enable }
         $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'ClientSettingsCheck'} | Select-Object -ExpandProperty 'Enable'
         Write-Output $obj
 	}
 
 	Function Get-XMLConfigClientSettingsCheckFix {
         # TODO implement in console extension and webservice
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.ClientSettingsCheck.Fix }
         $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'ClientSettingsCheck'} | Select-Object -ExpandProperty 'Fix'
         Write-Output $obj
 	}
 
     Function Get-XMLConfigWMI {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.WMI.Enable }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'WMI'} | Select-Object -ExpandProperty 'Enable'
         }
@@ -2813,6 +2954,7 @@ Begin {
     }
 
     Function Get-XMLConfigWMIRepairEnable {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.WMI.Fix }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'WMI'} | Select-Object -ExpandProperty 'Fix'
         }
@@ -2821,6 +2963,7 @@ Begin {
 
     Function Get-XMLConfigRefreshComplianceState {
         # Measured in days
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.RefreshComplianceState.Enable }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'RefreshComplianceState'} | Select-Object -ExpandProperty 'Enable'
         }
@@ -2828,6 +2971,7 @@ Begin {
     }
 
     Function Get-XMLConfigRefreshComplianceStateDays {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Options.RefreshComplianceState.Days }
         if ($config) {
             $obj = $Xml.Configuration.Option | Where-Object {$_.Name -like 'RefreshComplianceState'} | Select-Object -ExpandProperty 'Days'
         }
@@ -2835,6 +2979,7 @@ Begin {
     }
 
     Function Get-XMLConfigRemediationClientCertificate {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Remediation.ClientCertificate }
         if ($config) {
             $obj = $Xml.Configuration.Remediation | Where-Object {$_.Name -like 'ClientCertificate'} | Select-Object -ExpandProperty 'Fix'
         }
@@ -2842,11 +2987,17 @@ Begin {
     }
 
     Function Get-XMLConfigSQLServer {
+        if ($script:JsonConfig) {
+            $siteOverride = Get-SiteConfig -PropertyName 'SQLServer'
+            if ($siteOverride) { return [string]$siteOverride }
+            return [string]$script:JsonConfig.Logging.SQL.Server
+        }
         $obj = $Xml.Configuration.Log | Where-Object {$_.Name -like 'SQL'} | Select-Object -ExpandProperty 'Server'
         Write-Output $obj
     }
 
     Function Get-XMLConfigSQLLoggingEnable {
+        if ($script:JsonConfig) { return [string]$script:JsonConfig.Logging.SQL.Enabled }
         $obj = $Xml.Configuration.Log | Where-Object {$_.Name -like 'SQL'} | Select-Object -ExpandProperty 'Enable'
         Write-Output $obj
     }
@@ -3195,12 +3346,21 @@ Begin {
 
     # Validate config values to prevent injection via WMI filters and paths
     Function Test-ConfigValues {
-        Param([Parameter(Mandatory=$true)]$Xml)
+        Param([Parameter(Mandatory=$false)]$Xml)
 
         # Validate service names (used in WMI filters)
-        foreach ($svc in $Xml.Configuration.Service) {
-            if ($svc.Name -notmatch '^[a-zA-Z0-9_\-\.]+$') {
-                throw "Invalid service name in config: '$($svc.Name)'. Only alphanumeric, underscore, hyphen, and dot are allowed."
+        if ($script:JsonConfig) {
+            foreach ($svc in $script:JsonConfig.Services) {
+                if ($svc.Name -notmatch '^[a-zA-Z0-9_\-\.]+$') {
+                    throw "Invalid service name in config: '$($svc.Name)'. Only alphanumeric, underscore, hyphen, and dot are allowed."
+                }
+            }
+        }
+        else {
+            foreach ($svc in $Xml.Configuration.Service) {
+                if ($svc.Name -notmatch '^[a-zA-Z0-9_\-\.]+$') {
+                    throw "Invalid service name in config: '$($svc.Name)'. Only alphanumeric, underscore, hyphen, and dot are allowed."
+                }
             }
         }
 
@@ -3235,9 +3395,16 @@ Begin {
 
         # Build the ConfigMgr Client Install Property string
         $propertyString = ""
-        foreach ($property in $Xml.Configuration.ClientInstallProperty) {
-            $propertyString = $propertyString + $property
-            $propertyString = $propertyString + ' '
+        if ($script:JsonConfig) {
+            foreach ($property in $script:JsonConfig.ClientInstallProperties) {
+                $propertyString = $propertyString + $property + ' '
+            }
+        }
+        else {
+            foreach ($property in $Xml.Configuration.ClientInstallProperty) {
+                $propertyString = $propertyString + $property
+                $propertyString = $propertyString + ' '
+            }
         }
         $clientCacheSize = Get-XMLConfigClientCache
         $clientInstallProperties = $propertyString

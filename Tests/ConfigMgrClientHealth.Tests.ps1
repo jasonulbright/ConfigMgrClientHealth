@@ -320,3 +320,143 @@ Describe 'Script Structure' {
         $scriptContent | Should -Match 'SupportsShouldProcess'
     }
 }
+
+Describe 'JSON Config: config.json' {
+    BeforeAll {
+        $JsonConfigPath = Join-Path $PSScriptRoot '..\config.json'
+        $JsonConfig = Get-Content $JsonConfigPath -Raw | ConvertFrom-Json
+    }
+
+    It 'config.json exists and is valid JSON' {
+        { Get-Content $JsonConfigPath -Raw | ConvertFrom-Json } | Should -Not -Throw
+    }
+
+    It 'Has Client section with Version' {
+        $JsonConfig.Client.Version | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Has Client.SiteCode' {
+        $JsonConfig.Client.SiteCode | Should -Match '^[A-Za-z0-9]{3}$'
+    }
+
+    It 'Has Client.Cache with Size and Enable' {
+        $JsonConfig.Client.Cache.Size | Should -BeGreaterThan 0
+        $JsonConfig.Client.Cache.PSObject.Properties['Enable'] | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Has ClientInstallProperties as array' {
+        @($JsonConfig.ClientInstallProperties).Count | Should -BeGreaterThan 0
+    }
+
+    It 'Has Logging section with SQL' {
+        $JsonConfig.Logging.SQL | Should -Not -BeNullOrEmpty
+        $JsonConfig.Logging.SQL.PSObject.Properties['Server'] | Should -Not -BeNullOrEmpty
+        $JsonConfig.Logging.SQL.PSObject.Properties['Enabled'] | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Has Logging.TimeFormat' {
+        $JsonConfig.Logging.TimeFormat | Should -BeIn @('ClientLocal', 'UTC')
+    }
+
+    It 'Has Options section' {
+        $JsonConfig.Options | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Has Options.HardwareInventory with Days' {
+        $JsonConfig.Options.HardwareInventory.Days | Should -BeGreaterThan 0
+    }
+
+    It 'Has Services array with valid entries' {
+        $JsonConfig.Services | Should -Not -BeNullOrEmpty
+        $JsonConfig.Services.Count | Should -BeGreaterThan 0
+        foreach ($svc in $JsonConfig.Services) {
+            $svc.Name | Should -Match '^[a-zA-Z0-9_\-\.]+$'
+            $svc.State | Should -BeIn @('Running', 'Stopped')
+        }
+    }
+
+    It 'Has Remediation section' {
+        $JsonConfig.Remediation | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Has Sites section with Default' {
+        $JsonConfig.Sites | Should -Not -BeNullOrEmpty
+        $JsonConfig.Sites.PSObject.Properties['Default'] | Should -Not -BeNullOrEmpty
+    }
+}
+
+Describe 'JSON Config: Backward Compatibility' {
+    BeforeAll {
+        $scriptContent = Get-Content (Join-Path $PSScriptRoot '..\ConfigMgrClientHealth.ps1') -Raw
+    }
+
+    It 'Accepts both .xml and .json file extensions' {
+        $scriptContent | Should -Match "ValidatePattern\('.*xml.*json"
+    }
+
+    It 'Branches on file extension for config loading' {
+        $scriptContent | Should -Match "Config -match '\\\.json"
+    }
+
+    It 'Preserves XML fallback in Get-XMLConfig functions' {
+        # Each function should still have the XML path
+        $scriptContent | Should -Match 'Xml\.Configuration\.'
+    }
+
+    It 'Initializes JsonConfig to null' {
+        $scriptContent | Should -Match '\$script:JsonConfig\s*=\s*\$null'
+    }
+}
+
+Describe 'Site-Aware Config' {
+    BeforeAll {
+        $scriptContent = Get-Content (Join-Path $PSScriptRoot '..\ConfigMgrClientHealth.ps1') -Raw
+    }
+
+    It 'Get-SiteConfig function exists' {
+        $scriptContent | Should -Match 'Function Get-SiteConfig'
+    }
+
+    It 'Get-SiteConfig checks AD site name' {
+        $scriptContent | Should -Match 'Get-ClientSiteName'
+    }
+
+    It 'Get-SiteConfig falls back to Default' {
+        $scriptContent | Should -Match "PSObject\.Properties\['Default'\]"
+    }
+
+    It 'SQL server accessor uses site override' {
+        $scriptContent | Should -Match "Get-SiteConfig\s+-PropertyName\s+'SQLServer'"
+    }
+
+    It 'Client share accessor uses site override' {
+        $scriptContent | Should -Match "Get-SiteConfig\s+-PropertyName\s+'ClientShare'"
+    }
+
+    It 'Log share accessor uses site override' {
+        $scriptContent | Should -Match "Get-SiteConfig\s+-PropertyName\s+'LogShare'"
+    }
+}
+
+Describe 'Config Caching' {
+    BeforeAll {
+        $scriptContent = Get-Content (Join-Path $PSScriptRoot '..\ConfigMgrClientHealth.ps1') -Raw
+    }
+
+    It 'Defines cache path in ProgramData' {
+        $scriptContent | Should -Match 'ConfigMgrClientHealth'
+        $scriptContent | Should -Match 'config\.json\.cache'
+    }
+
+    It 'Caches config after successful JSON load' {
+        $scriptContent | Should -Match 'Set-Content\s+-Path\s+\$ConfigCachePath'
+    }
+
+    It 'Falls back to cache when config file unreachable' {
+        $scriptContent | Should -Match 'Using cached config from'
+    }
+
+    It 'Warns when using cached config' {
+        $scriptContent | Should -Match 'Write-Warning.*cached config'
+    }
+}
