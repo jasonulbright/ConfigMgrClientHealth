@@ -2,11 +2,11 @@
 .SYNOPSIS
     ConfigMgr Client Health is a tool that validates and automatically fixes errors on Windows computers managed by Microsoft Configuration Manager.
 .EXAMPLE
-   .\ConfigMgrClientHealth.ps1 -Config .\Config.Xml
+   .\ConfigMgrClientHealth.ps1 -Config .\config.json
 .EXAMPLE
-    \\cm01.rodland.lab\ClientHealth$\ConfigMgrClientHealth.ps1 -Config \\cm01.rodland.lab\ClientHealth$\Config.Xml -Webservice https://cm01.rodland.lab/ConfigMgrClientHealth
+    .\ConfigMgrClientHealth.ps1 -Config .\config.json -Webservice http://sccm01:5000
 .PARAMETER Config
-    A single parameter specifying the path to the configuration XML file.
+    Path to the configuration file (.json or .xml).
 .PARAMETER Webservice
     A single parameter specifying the URI to the ConfigMgr Client Health Webservice.
 .DESCRIPTION
@@ -41,7 +41,7 @@
 
 [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact="Medium")]
 param(
-    [Parameter(HelpMessage='Path to XML Configuration File')]
+    [Parameter(HelpMessage='Path to JSON or XML configuration file')]
     [ValidateScript({Test-Path -Path $_ -PathType Leaf})]
     [ValidatePattern('\.(xml|json)$')]
     [string]$Config,
@@ -51,7 +51,7 @@ param(
 
 Begin {
     # ConfigMgr Client Health Version
-    $Version = '0.8.3'
+    $Version = '1.0.1'
     $script:JsonConfig = $null
     $global:ScriptPath = split-path -parent $MyInvocation.MyCommand.Definition
 
@@ -1613,64 +1613,104 @@ Begin {
             [Parameter(Mandatory=$false)]$FirstInstall=$false
             )
 
+        # Resolve ccmsetup.exe: configured share > download from MP > error
         $ClientShare = Get-XMLConfigClientShare
-        if ((Test-Path $ClientShare -ErrorAction SilentlyContinue) -eq $true) {
-            if ($FirstInstall -eq $true) { $text = 'Installing Configuration Manager Client.' }
-            else { $text = 'Client tagged for reinstall. Reinstalling client...' }
-            Write-Output $text
+        $ccmSetupPath = $null
 
-            Write-Verbose "Perform a test on a specific registry key required for ccmsetup to succeed."
-            Test-CCMSetup1
-
-            Write-Verbose "Enforce registration of common DLL files to make sure CCM Agent works."
-            $DllFiles = 'actxprxy.dll', 'atl.dll', 'Bitsprx2.dll', 'Bitsprx3.dll', 'browseui.dll', 'cryptdlg.dll', 'dssenh.dll', 'gpkcsp.dll', 'initpki.dll', 'jscript.dll', 'mshtml.dll', 'msi.dll', 'mssip32.dll', 'msxml.dll', 'msxml3.dll', 'msxml3a.dll', 'msxml3r.dll', 'msxml4.dll', 'msxml4a.dll', 'msxml4r.dll', 'msxml6.dll', 'msxml6r.dll', 'muweb.dll', 'ole32.dll', 'oleaut32.dll', 'Qmgr.dll', 'Qmgrprxy.dll', 'rsaenh.dll', 'sccbase.dll', 'scrrun.dll', 'shdocvw.dll', 'shell32.dll', 'slbcsp.dll', 'softpub.dll', 'rlmon.dll', 'userenv.dll', 'vbscript.dll', 'Winhttp.dll', 'wintrust.dll', 'wuapi.dll', 'wuaueng.dll', 'wuaueng1.dll', 'wucltui.dll', 'wucltux.dll', 'wups.dll', 'wups2.dll', 'wuweb.dll', 'wuwebv.dll', 'Xpob2res.dll', 'WBEM\wmisvc.dll'
-            foreach ($Dll in $DllFiles) {
-                $file =  $env:windir +"\System32\$Dll"
-                Register-DLLFile -FilePath $File
-            }
-
-            if ($Uninstall -eq $true) {
-				Write-Verbose "Trigger ConfigMgr Client uninstallation."
-				Start-Process -FilePath "$ClientShare\ccmsetup.exe" -ArgumentList @('/uninstall') -NoNewWindow
-
-				$launched = $true
-				do {
-					Start-Sleep -seconds 5
-					if (Get-Process "ccmsetup" -ErrorAction SilentlyContinue) {
-						Write-Verbose "ConfigMgr Client Uninstallation still running"
-						$launched = $true
-					}
-					else { $launched = $false }
-                } while ($launched -eq $true)
-            }
-
-            $argArray = @($ClientInstallProperties -split '\s+')
-            Write-Verbose "Trigger ConfigMgr Client installation."
-            Write-Verbose "Client install string: $ClientShare\ccmsetup.exe $ClientInstallProperties"
-            Start-Process -FilePath "$ClientShare\ccmsetup.exe" -ArgumentList $argArray -NoNewWindow
-
-			$launched = $true
-			do {
-				Start-Sleep -seconds 5
-				if (Get-Process "ccmsetup" -ErrorAction SilentlyContinue) {
-					Write-Verbose "ConfigMgr Client installation still running"
-					$launched = $true
-				}
-				else { $launched = $false }
-            } while ($launched -eq $true)
-
-            if ($FirstInstall -eq $true) {
-                Write-Host "ConfigMgr Client was installed for the first time. Waiting 6 minutes for client to syncronize policy before proceeding."
-                Start-Sleep -Seconds 360
-            }
-
-            
-
+        # Option 1: Configured file share
+        if (-not [string]::IsNullOrWhiteSpace($ClientShare) -and (Test-Path $ClientShare -ErrorAction SilentlyContinue)) {
+            $ccmSetupPath = Join-Path $ClientShare 'ccmsetup.exe'
+            Write-Verbose "Using ccmsetup.exe from configured share: $ClientShare"
         }
-        else {
-            $text = 'ERROR: Client tagged for reinstall, but failed to access fileshare: ' +$ClientShare
+
+        # Option 2: Download fresh from Management Point
+        if (-not $ccmSetupPath) {
+            # Parse MP from ClientInstallProperties (SMSMP=server or /mp:server)
+            $mpFqdn = $null
+            foreach ($token in ($ClientInstallProperties -split '\s+')) {
+                if ($token -match '^SMSMP=(.+)$')  { $mpFqdn = $Matches[1]; break }
+                if ($token -match '^/mp:(.+)$')    { $mpFqdn = $Matches[1]; break }
+            }
+
+            if ($mpFqdn) {
+                $downloadUrl = "http://$mpFqdn/CCM_Client/ccmsetup.exe"
+                $tempDir = Join-Path $env:TEMP 'ConfigMgrClientHealth'
+                if (-not (Test-Path $tempDir)) { New-Item -Path $tempDir -ItemType Directory -Force | Out-Null }
+                $tempCcmSetup = Join-Path $tempDir 'ccmsetup.exe'
+
+                try {
+                    Write-Verbose "Downloading ccmsetup.exe from MP: $downloadUrl"
+                    Invoke-WebRequest -Uri $downloadUrl -OutFile $tempCcmSetup -UseBasicParsing -ErrorAction Stop
+                    if (Test-Path $tempCcmSetup) {
+                        $ccmSetupPath = $tempCcmSetup
+                        Write-Output "Downloaded ccmsetup.exe from Management Point: $mpFqdn"
+                    }
+                }
+                catch {
+                    Write-Warning "Failed to download ccmsetup.exe from $downloadUrl : $_"
+                }
+            }
+            else {
+                Write-Warning "No MP= or /MP: found in ClientInstallProperties. Cannot download ccmsetup.exe from Management Point."
+            }
+        }
+
+        if (-not $ccmSetupPath) {
+            $text = 'ERROR: Client tagged for reinstall, but ccmsetup.exe not available. '
+            if (-not [string]::IsNullOrWhiteSpace($ClientShare)) { $text += "Share not accessible: $ClientShare. " }
+            $text += 'Download from MP failed or no MP configured. '
+            $text += 'Set MP= or /MP: in ClientInstallProperties, or configure Client.Share with a reachable UNC path.'
             Write-Error $text
             Exit 1
+        }
+
+        if ($FirstInstall -eq $true) { $text = 'Installing Configuration Manager Client.' }
+        else { $text = 'Client tagged for reinstall. Reinstalling client...' }
+        Write-Output $text
+
+        Write-Verbose "Perform a test on a specific registry key required for ccmsetup to succeed."
+        Test-CCMSetup1
+
+        Write-Verbose "Enforce registration of common DLL files to make sure CCM Agent works."
+        $DllFiles = 'actxprxy.dll', 'atl.dll', 'Bitsprx2.dll', 'Bitsprx3.dll', 'browseui.dll', 'cryptdlg.dll', 'dssenh.dll', 'gpkcsp.dll', 'initpki.dll', 'jscript.dll', 'mshtml.dll', 'msi.dll', 'mssip32.dll', 'msxml.dll', 'msxml3.dll', 'msxml3a.dll', 'msxml3r.dll', 'msxml4.dll', 'msxml4a.dll', 'msxml4r.dll', 'msxml6.dll', 'msxml6r.dll', 'muweb.dll', 'ole32.dll', 'oleaut32.dll', 'Qmgr.dll', 'Qmgrprxy.dll', 'rsaenh.dll', 'sccbase.dll', 'scrrun.dll', 'shdocvw.dll', 'shell32.dll', 'slbcsp.dll', 'softpub.dll', 'rlmon.dll', 'userenv.dll', 'vbscript.dll', 'Winhttp.dll', 'wintrust.dll', 'wuapi.dll', 'wuaueng.dll', 'wuaueng1.dll', 'wucltui.dll', 'wucltux.dll', 'wups.dll', 'wups2.dll', 'wuweb.dll', 'wuwebv.dll', 'Xpob2res.dll', 'WBEM\wmisvc.dll'
+        foreach ($Dll in $DllFiles) {
+            $file =  $env:windir +"\System32\$Dll"
+            Register-DLLFile -FilePath $File
+        }
+
+        if ($Uninstall -eq $true) {
+            Write-Verbose "Trigger ConfigMgr Client uninstallation."
+            Start-Process -FilePath $ccmSetupPath -ArgumentList @('/uninstall') -NoNewWindow
+
+            $launched = $true
+            do {
+                Start-Sleep -seconds 5
+                if (Get-Process "ccmsetup" -ErrorAction SilentlyContinue) {
+                    Write-Verbose "ConfigMgr Client Uninstallation still running"
+                    $launched = $true
+                }
+                else { $launched = $false }
+            } while ($launched -eq $true)
+        }
+
+        $argArray = @($ClientInstallProperties -split '\s+')
+        Write-Verbose "Trigger ConfigMgr Client installation."
+        Write-Verbose "Client install string: $ccmSetupPath $ClientInstallProperties"
+        Start-Process -FilePath $ccmSetupPath -ArgumentList $argArray -NoNewWindow
+
+        $launched = $true
+        do {
+            Start-Sleep -seconds 5
+            if (Get-Process "ccmsetup" -ErrorAction SilentlyContinue) {
+                Write-Verbose "ConfigMgr Client installation still running"
+                $launched = $true
+            }
+            else { $launched = $false }
+        } while ($launched -eq $true)
+
+        if ($FirstInstall -eq $true) {
+            Write-Host "ConfigMgr Client was installed for the first time. Waiting 6 minutes for client to syncronize policy before proceeding."
+            Start-Sleep -Seconds 360
         }
     }
 

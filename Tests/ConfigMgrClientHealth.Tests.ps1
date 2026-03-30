@@ -210,7 +210,7 @@ Describe 'Client Install Safety' {
     }
 
     It 'Uses Start-Process for ccmsetup.exe instead of Invoke-Expression' {
-        $scriptContent | Should -Match "Start-Process\s+-FilePath.*ccmsetup\.exe"
+        $scriptContent | Should -Match "Start-Process\s+-FilePath\s+\`$ccmSetupPath"
     }
 
     It 'Uses -ArgumentList array for ccmsetup parameters' {

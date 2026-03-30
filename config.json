@@ -19,12 +19,10 @@
     },
     "ClientInstallProperties": [
         "SMSSITECODE=AR1",
-        "MP=MEMCM01.andersrodland.com",
+        "SMSMP=MEMCM01.andersrodland.com",
         "FSP=MEMCM01.andersrodland.com",
         "DNSSUFFIX=andersrodland.com",
-        "/Source:\\\\MEMCM01.andersrodland.com\\Clienthealth$\\client",
-        "/MP:MEMCM01.andersrodland.com",
-        "/skipprereq:silverlight.exe"
+        "/mp:MEMCM01.andersrodland.com"
     ],
     "Logging": {
         "Share": "\\\\MEMCM01.andersrodland.com\\ClientHealthLogs$",

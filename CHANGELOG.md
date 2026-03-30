@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.0.1] - 2026-03-30
+
+### Added
+- **Automated setup wizard** -- `Deploy/Install-ClientHealth.ps1` guides through environment setup, generates config.json, creates the ClientHealth SQL database, provisions all MECM objects (Package, Program, CI, Baseline, deployments), and optionally installs the REST API webservice as a Windows Service. Supports interactive and unattended modes.
+- **51 Pester tests** for the setup wizard -- config generation, function contracts, security, compatibility with the main script.
+- **ccmsetup.exe download from MP** -- `Resolve-Client` now downloads a fresh `ccmsetup.exe` from `http://<MP>/CCM_Client/ccmsetup.exe` when `Client.Share` is empty or unreachable, avoiding reliance on potentially corrupt local files.
+
+### Changed
+- **ClientInstallProperties corrected per Microsoft docs** -- replaced undocumented `MP=` with documented `SMSMP=` (client.msi property for initial management point). `/mp:` ccmsetup parameter retained for installation source. Removed `/Source:` (unnecessary) and `/skipprereq:silverlight.exe` (obsolete).
+- **Comprehensive README** -- full configuration reference, all 25 health checks documented, API reference, deployment walkthroughs, troubleshooting guide.
+
+### Fixed
+- **CI creation used nonexistent cmdlets** -- replaced `New-CMComplianceSettingScript` / `Add-CMComplianceSettingScript -Setting -Rule` (don't exist) with single `Add-CMComplianceSettingScript` call using `-ValueRule` parameter set, verified against Microsoft docs.
+- **`Resolve-Client` would `Exit 1` with empty `Client.Share`** -- the original script required a file share with ccmsetup.exe staged. Now gracefully falls back to MP download.
+
+---
+
 ## [1.0.0] - 2026-03-30 (Community Fork)
 
 ### Security (Critical)
