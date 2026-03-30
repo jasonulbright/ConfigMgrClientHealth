@@ -217,24 +217,21 @@ Begin {
     Function Update-Webservice {
         Param([Parameter(Mandatory=$true)][String]$URI, $Log)
 
-        $Hostname = Get-Hostname
         $Obj = $Log | ConvertTo-Json
-        $URI = $URI + "/Clients"
+        $ApiUri = "$URI/api/Clients"
         $ContentType = "application/json"
 
-        # Detect if we use PUT or POST
+        # POST with UPSERT — the API handles create-or-update
         try {
-            Invoke-RestMethod -Uri "$URI/$Hostname" | Out-Null
-            $Method = "PUT"
-            $URI = $URI + "/$Hostname"
+            Invoke-WithRetry -OperationName 'Webservice POST' -ScriptBlock {
+                Invoke-RestMethod -Method POST -Uri $ApiUri -Body $Obj -ContentType $ContentType | Out-Null
+            }
+            Write-Verbose "Webservice updated successfully"
         }
-        catch { $Method = "POST" }
-
-        try { Invoke-RestMethod -Method $Method -Uri $URI -Body $Obj -ContentType $ContentType | Out-Null }
         catch {
             $ExceptionMessage = $_.Exception.Message
-            Write-Host "Error Invoking RestMethod $Method on URI $URI. Failed to update database using webservice. Exception: $ExceptionMessage"
-
+            Write-Warning "Error updating webservice at $ApiUri : $ExceptionMessage"
+            Out-LogFile -Xml $Xml -Text "ERROR Webservice POST: $ExceptionMessage" -Severity 3
         }
     }
 
