@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.2] - 2026-03-30
+
+### Added
+- **Remediation break scripts** -- 12 scripts in `Tests/BreakScripts/` that intentionally introduce specific health issues on lab endpoints for validation testing. Includes `Break-All.ps1` for full end-to-end testing and `Get-HealthState.ps1` for read-only pre/post comparison. Safety-gated behind `$env:YOURLAB = 'true'`.
+- **README: Remediation Testing section** -- full testing workflow documentation with step-by-step instructions, script reference table, safety notes, and scope limitations.
+
+---
+
 ## [1.0.1] - 2026-03-30
 
 ### Added

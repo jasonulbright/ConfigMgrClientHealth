@@ -37,6 +37,7 @@ Automated detection and remediation of common MECM/ConfigMgr client health issue
 - [SQL Database Schema](#sql-database-schema)
 - [Migrating from XML to JSON](#migrating-from-xml-to-json)
 - [Tests](#tests)
+- [Remediation Testing (Break Scripts)](#remediation-testing-break-scripts)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
 - [Credits](#credits)
@@ -696,6 +697,101 @@ Invoke-Pester .\Tests\ -Output Detailed
 | Setup wizard (Install-ClientHealth.ps1) | 51 |
 | Setup wizard config generation | 20 |
 | Setup wizard security | 5 |
+
+---
+
+## Remediation Testing (Break Scripts)
+
+The `Tests/BreakScripts/` directory contains scripts that intentionally introduce specific health issues on a lab endpoint so you can validate that the health check detects and remediates each one in isolation.
+
+### Prerequisites
+
+- A lab VM with the ConfigMgr client installed (do **not** run these on production endpoints)
+- Local administrator rights
+- Set the safety flag in your PowerShell session before any break script will execute:
+
+```powershell
+$env:YOURLAB = 'true'
+```
+
+Every break script checks for this flag and refuses to run without it.
+
+### Available Scripts
+
+| Script | What It Breaks | Health Check Validated |
+|--------|---------------|----------------------|
+| `Break-Services.ps1` | Stops BITS and ccmexec, sets wuauserv startup to Disabled | Service monitoring and startup type correction |
+| `Break-SiteCode.ps1` | Reassigns the client to site code `ZZZ` via COM | Site code validation and reassignment |
+| `Break-CacheSize.ps1` | Sets client cache to 1 MB via COM | Cache size detection and correction |
+| `Break-LogSize.ps1` | Sets CCM log max size to 100 KB and history to 0 via registry | Log size and history correction |
+| `Break-ProvisioningMode.ps1` | Enables provisioning mode via registry | Provisioning mode detection and exit |
+| `Break-AdminShares.ps1` | Disables ADMIN$ and C$ shares via `AutoShareWks` registry key | Admin share re-enablement via Server service restart |
+| `Break-HWInventory.ps1` | Deletes the hardware inventory timestamp from WMI | Stale inventory detection and scan trigger |
+| `Break-WUAHandler.ps1` | Overwrites `registry.pol` with a zero-byte file and backdates it 60 days | WUA handler / GPO corruption detection, `gpupdate` repair |
+| `Break-ComplianceState.ps1` | Sets last compliance state refresh to 61 days ago in registry | Compliance state staleness detection and forced refresh |
+| `Break-LastRun.ps1` | Deletes the `LastRun` registry value used by CI detection | Baseline non-compliance trigger, remediation script execution |
+| `Break-All.ps1` | Runs all 10 break scripts in sequence | Full end-to-end health check and remediation validation |
+| `Get-HealthState.ps1` | Read-only snapshot of current health state (safe to run anywhere) | Pre/post comparison to verify remediation worked |
+
+### Testing Workflow
+
+**Step 1: Capture baseline state**
+
+```powershell
+$env:YOURLAB = 'true'
+.\Tests\BreakScripts\Get-HealthState.ps1
+```
+
+This prints a color-coded report of every health item: green for OK, red for broken, yellow for warnings. Save or screenshot this for comparison.
+
+**Step 2: Break one or more items**
+
+Break a single item for targeted testing:
+
+```powershell
+.\Tests\BreakScripts\Break-Services.ps1
+```
+
+Or break everything at once for a full validation run:
+
+```powershell
+.\Tests\BreakScripts\Break-All.ps1
+```
+
+**Step 3: Confirm the broken state**
+
+```powershell
+.\Tests\BreakScripts\Get-HealthState.ps1
+```
+
+You should see red entries for everything you broke.
+
+**Step 4: Run the health check**
+
+```powershell
+.\ConfigMgrClientHealth.ps1 -Config .\config.json -Verbose
+```
+
+The `-Verbose` flag shows every detection and remediation action in real time. Watch for each broken item being detected and fixed.
+
+**Step 5: Verify remediation**
+
+```powershell
+.\Tests\BreakScripts\Get-HealthState.ps1
+```
+
+All items should be green again. If any remain red, check the log at `%ProgramData%\ConfigMgrClientHealth\ClientHealth.log` (CMTrace format) for details on what failed and why.
+
+### What These Scripts Do NOT Touch
+
+These scripts are designed to be safe for lab use:
+
+- No disk partition changes, boot configuration edits, or system file deletion
+- No WMI repository corruption (WMI rebuild is destructive and takes minutes to recover)
+- No client uninstallation (reinstall takes 10+ minutes and requires MP access)
+- No DNS record manipulation (affects network connectivity beyond the client)
+
+If you need to test WMI repair or client reinstallation, those scenarios are better tested by stopping the `winmgmt` service and renaming the WMI repository folder, or by manually uninstalling the client -- both of which require manual revert steps that don't lend themselves to a simple break/fix script.
 
 ---
 
