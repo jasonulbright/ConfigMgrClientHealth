@@ -36,7 +36,6 @@ Automated detection and remediation of common MECM/ConfigMgr client health issue
 - [API Reference](#api-reference)
 - [SQL Database Schema](#sql-database-schema)
 - [Migrating from XML to JSON](#migrating-from-xml-to-json)
-- [Tests](#tests)
 - [Remediation Testing (Break Scripts)](#remediation-testing-break-scripts)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
@@ -60,6 +59,7 @@ Automated detection and remediation of common MECM/ConfigMgr client health issue
 - **Config caching** -- Caches last-known-good config locally. VPN/ZPA clients continue operating when the network config path is unreachable.
 - **Automated setup wizard** -- `Install-ClientHealth.ps1` guides you through environment setup, generates config, creates the database, provisions MECM objects, and optionally installs the API webservice.
 - **REST API webservice** -- Modern ASP.NET Core minimal API replaces the original IIS-hosted webservice. Runs as a Windows Service, no IIS required.
+- **MP-only client reinstall** -- `ccmsetup.exe` is always downloaded fresh from a configured Management Point at reinstall time. No `Client.Share` lookup, no relying on potentially stale on-disk copies. Multi-MP environments configure an array of MPs; the script shuffles, tries each in turn, and falls through on failure so a single down MP does not sink the install.
 
 ### Reliability
 
@@ -98,7 +98,8 @@ The wizard prompts for:
 | Site code | Exactly 3 alphanumeric chars | `MCM` |
 | Site server FQDN | Must contain a dot | `sccm01.contoso.com` |
 | Domain | Auto-detected from server FQDN | `contoso.com` |
-| Management point FQDN | Defaults to site server | `sccm01.contoso.com` |
+| Management point FQDN(s) | Defaults to site server; comma-separated for multiple MPs | `sccm01.contoso.com,sccm02.contoso.com` |
+| Download ccmsetup.exe over HTTPS? | y/n; default `n` | `n` |
 | SQL Server | Live connectivity test | `sccmdbs.contoso.com` |
 | Client share UNC | Valid UNC path | `\\fileshare\ClientHealth$` |
 | Log share UNC | Valid UNC path | `\\fileshare\ClientHealthLogs$` |
@@ -133,7 +134,7 @@ For unattended/scripted setup:
     -SiteCode 'MCM' `
     -SiteServer 'sccm01.contoso.com' `
     -Domain 'contoso.com' `
-    -ManagementPoint 'sccm01.contoso.com' `
+    -ManagementPoints 'sccm01.contoso.com','sccm02.contoso.com' `
     -SqlServer 'sccmdbs.contoso.com' `
     -ClientSharePath '\\fileshare\ClientHealth$' `
     -LogSharePath '\\fileshare\ClientHealthLogs$' `
@@ -177,14 +178,17 @@ Edit `config.json` for your environment. At minimum, update:
     "Client": {
         "Version": "5.00.9128.1007",
         "SiteCode": "MCM",
-        "Domain": "contoso.com"
+        "Domain": "contoso.com",
+        "ManagementPoints": [
+            "sccm01.contoso.com",
+            "sccm02.contoso.com"
+        ],
+        "MPHttps": false
     },
     "ClientInstallProperties": [
         "SMSSITECODE=MCM",
-        "SMSMP=sccm01.contoso.com",
         "FSP=sccm01.contoso.com",
-        "DNSSUFFIX=contoso.com",
-        "/mp:sccm01.contoso.com"
+        "DNSSUFFIX=contoso.com"
     ],
     "Logging": {
         "Share": "\\\\fileshare\\ClientHealthLogs$",
@@ -228,7 +232,8 @@ The script accepts two parameters:
 | `Client.SiteCode` | string | -- | Expected 3-character MECM site code |
 | `Client.Domain` | string | -- | Expected Active Directory domain |
 | `Client.AutoUpgrade` | bool | `true` | Automatically upgrade agent if below minimum version |
-| `Client.Share` | string | `""` | UNC path to a folder containing ccmsetup.exe. Optional -- if empty or unreachable, the script downloads a fresh copy from the Management Point (`http://<MP>/CCM_Client/ccmsetup.exe`). The MP is parsed from the `MP=` or `/MP:` entry in `ClientInstallProperties`. |
+| `Client.ManagementPoints` | string[] | -- | Management point FQDNs used to download `ccmsetup.exe`. The script shuffles the list, tries each MP until download succeeds, then injects that MP into the install arguments at runtime. |
+| `Client.MPHttps` | bool | `false` | Download `ccmsetup.exe` from MPs over HTTPS instead of HTTP. |
 | `Client.Cache.Size` | int | `16384` | Client cache size in MB. Supports percentage strings (e.g., `"5%"`) |
 | `Client.Cache.DeleteOrphanedData` | bool | `true` | Remove orphaned cache packages not tracked by CM |
 | `Client.Cache.Enable` | bool | `true` | Enable cache size validation |
@@ -243,13 +248,12 @@ Array of strings passed to `ccmsetup.exe` when installing or reinstalling the cl
 ```json
 "ClientInstallProperties": [
     "SMSSITECODE=MCM",
-    "MP=sccm01.contoso.com",
     "FSP=sccm01.contoso.com",
-    "DNSSUFFIX=contoso.com",
-    "/MP:sccm01.contoso.com",
-    "/skipprereq:silverlight.exe"
+    "DNSSUFFIX=contoso.com"
 ]
 ```
+
+Do not maintain `SMSMP=`, `MP=`, or `/mp:` here for new JSON configs. Put MPs in `Client.ManagementPoints`; at install time the script picks a reachable MP, strips any stale MP tokens from this array, and injects both `SMSMP=<selectedMp>` and `/mp:<selectedMp>` into the `ccmsetup.exe` command line. Legacy configs that still contain `SMSMP=`, `MP=`, or `/mp:` are read as a fallback when `Client.ManagementPoints` is missing.
 
 There are two kinds of entries in this array:
 
@@ -257,7 +261,7 @@ There are two kinds of entries in this array:
 
 | Parameter | Description |
 |-----------|-------------|
-| `/mp:server.domain.com` | Management point to download installation files from. Can specify multiple separated by `;`. |
+| `/mp:server.domain.com` | Management point to download installation files from. Managed by the script at runtime from `Client.ManagementPoints`. |
 | `/skipprereq:file.exe` | Skip a specific prerequisite check |
 | `/logon` | Don't reinstall if a client is already installed |
 | `/UsePKICert` | Use PKI client certificate for HTTPS |
@@ -269,16 +273,16 @@ There are two kinds of entries in this array:
 | Property | Description |
 |----------|-------------|
 | `SMSSITECODE=XXX` | Site code to assign the client to (3 chars, or `AUTO`) |
-| `SMSMP=server.domain.com` | Initial management point. The client will discover and migrate to other MPs through normal MP rotation after registration. |
+| `SMSMP=server.domain.com` | Initial management point. Managed by the script at runtime from `Client.ManagementPoints`. |
 | `FSP=server.domain.com` | Fallback status point FQDN |
 | `DNSSUFFIX=domain.com` | DNS domain for MP discovery. Not needed if the client is in the same domain as a published MP. |
 | `CCMHTTPPORT=80` | HTTP port for client-to-site communication |
 | `CCMHTTPSPORT=443` | HTTPS port for client-to-site communication |
 | `RESETKEYINFORMATION=TRUE` | Remove stale trusted root key (useful when moving between hierarchies) |
 
-> **Note:** `/Source:` is not needed. When reinstalling, the script first checks `Client.Share`, then downloads a fresh `ccmsetup.exe` directly from the MP via `http://<MP>/CCM_Client/ccmsetup.exe`. The MP FQDN is parsed from the `SMSMP=` or `/mp:` entry in this array. This avoids relying on potentially corrupt local files -- the whole reason this script exists.
+> **Note:** `/Source:` is not needed. When reinstalling, the script downloads a fresh `ccmsetup.exe` directly from the selected MP via `http://<MP>/CCM_Client/ccmsetup.exe` or `https://<MP>/CCM_Client/ccmsetup.exe`. This avoids relying on potentially corrupt local files -- the whole reason this script exists.
 
-> **Important:** The `/mp:` parameter and `SMSMP=` property serve different purposes. `/mp:` tells ccmsetup.exe where to download installation files from -- it has no effect after installation. `SMSMP=` sets the initial management point the client uses after it's installed. The client will naturally discover and fail over to other MPs through normal site operations. Both should be specified.
+> **Important:** `/mp:` and `SMSMP=` serve different purposes, but you should not hard-code either one in JSON configs. `/mp:` tells `ccmsetup.exe` where to download installation files from; `SMSMP=` sets the initial management point the client uses after installation. The script injects both values from the selected `Client.ManagementPoints` entry.
 
 ### Logging
 
@@ -373,13 +377,20 @@ For multi-site deployments, the `Sites` section provides per-site overrides. The
 
 ```json
 "Sites": {
-    "NYC-Office":  { "SQLServer": "sql-nyc01.contoso.com",  "ClientShare": "\\\\dp-nyc01\\ClientHealth$" },
-    "LAX-Office":  { "SQLServer": "sql-lax01.contoso.com" },
+    "NYC-Office":  {
+        "SQLServer": "sql-nyc01.contoso.com",
+        "ManagementPoints": [ "mp-nyc01.contoso.com", "mp-nyc02.contoso.com" ],
+        "LogShare": "\\\\dp-nyc01\\ClientHealthLogs$"
+    },
+    "LAX-Office":  {
+        "SQLServer": "sql-lax01.contoso.com",
+        "ManagementPoints": [ "mp-lax01.contoso.com" ]
+    },
     "Default":     {}
 }
 ```
 
-Supported override properties: `SQLServer`, `ClientShare`, `LogShare`
+Supported override properties: `SQLServer`, `ManagementPoints`, `MPHttps`, `LogShare`. Per-site `ManagementPoints` is the typical use -- each AD site gets its local MPs and the random-pick stays local instead of bouncing across WAN links.
 
 ---
 
@@ -391,7 +402,7 @@ The script runs these checks in sequence. Each check logs its result and remedia
 |---|-------|-----------------|-------------|--------|
 | 1 | **WMI Repository** | Corrupt WMI (`winmgmt /verifyrepository`) | Re-registers WMI binaries, rebuilds repository | `Options.WMI` |
 | 2 | **Compliance State** | Stale compliance evaluation | Triggers `RefreshServerComplianceState()` | `Options.RefreshComplianceState` |
-| 3 | **CM Client Installed** | Client not installed, missing DB files, corrupt SQLCE, service won't start | Downloads fresh ccmsetup.exe from MP, reinstalls with configured properties | `Client.Version`, `Client.AutoUpgrade` |
+| 3 | **CM Client Installed** | Client not installed, missing DB files, corrupt SQLCE, service won't start | Picks an MP from `Client.ManagementPoints` (random, retries the next on failure), downloads a fresh `ccmsetup.exe` from that MP, reinstalls with configured properties + injected `SMSMP=`/`/mp:` | `Client.ManagementPoints`, `Client.MPHttps`, `Client.Version`, `Client.AutoUpgrade` |
 | 4 | **Client Version** | Agent below minimum version | Upgrade via ccmsetup.exe | `Client.Version`, `Client.AutoUpgrade` |
 | 5 | **Services** | Wrong startup type, not running, uptime exceeded | Set startup type, start/stop service | `Services` array |
 | 6 | **Site Code** | Assigned to wrong site | Reassign via `SMS_Client.SetAssignedSite()` | `Client.SiteCode` |
@@ -669,34 +680,12 @@ A conversion helper is included:
 .\Convert-ConfigXmlToJson.ps1
 ```
 
----
+### Deprecated fields
 
-## Tests
-
-128 Pester tests validate script integrity, security, configuration generation, and deployment automation:
-
-```powershell
-Invoke-Pester .\Tests\ -Output Detailed
-```
-
-**Test coverage includes:**
-
-| Area | Tests |
-|------|-------|
-| Script integrity (parses, required blocks present) | 5 |
-| Security (no Invoke-Expression, parameterized SQL, no hardcoded credentials) | 8 |
-| CIM migration (no Get-WmiObject, no Invoke-WmiMethod, no [wmiclass]) | 9 |
-| Error handling (no empty catch blocks, retry logic) | 3 |
-| Client install safety (Start-Process, argument arrays) | 3 |
-| JSON config schema | 15 |
-| XML config schema | 9 |
-| JSON/XML backward compatibility | 4 |
-| Site-aware config resolution | 6 |
-| Config caching mechanism | 4 |
-| SQL schema alignment | 5 |
-| Setup wizard (Install-ClientHealth.ps1) | 51 |
-| Setup wizard config generation | 20 |
-| Setup wizard security | 5 |
+| Field | Status | Replacement |
+|-------|--------|-------------|
+| `Client.Share` (and `<ClientShare>` in XML) | Deprecated. Setting it triggers a warning at reinstall. | Configure `Client.ManagementPoints` instead. `ccmsetup.exe` is downloaded directly from the selected MP -- no UNC share required. |
+| `SMSMP=` / `MP=` / `/mp:` in `ClientInstallProperties` | Honored only as a legacy fallback when `Client.ManagementPoints` is missing. | Move MPs into `Client.ManagementPoints`. The script injects the picked MP into the `ccmsetup.exe` command line at runtime. |
 
 ---
 

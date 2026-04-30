@@ -1,4 +1,5 @@
 using ClientHealthApi.Data;
+using ClientHealthApi.Converters;
 using ClientHealthApi.Models;
 using Microsoft.EntityFrameworkCore;
 
@@ -10,6 +11,12 @@ builder.Host.UseWindowsService();
 // Database
 builder.Services.AddDbContext<ClientHealthDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("ClientHealth")));
+
+// Accept legacy client timestamp strings such as "2026-04-30 12:34:56".
+builder.Services.ConfigureHttpJsonOptions(options =>
+{
+    options.SerializerOptions.Converters.Add(new ClientHealthDateTimeConverter());
+});
 
 // Logging
 builder.Logging.AddConsole();

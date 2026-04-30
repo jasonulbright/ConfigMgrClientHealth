@@ -5,7 +5,10 @@
         "SiteCode": "AR1",
         "Domain": "andersrodland.com",
         "AutoUpgrade": true,
-        "Share": "",
+        "ManagementPoints": [
+            "MEMCM01.andersrodland.com"
+        ],
+        "MPHttps": false,
         "Cache": {
             "Size": 16384,
             "DeleteOrphanedData": true,
@@ -19,10 +22,8 @@
     },
     "ClientInstallProperties": [
         "SMSSITECODE=AR1",
-        "SMSMP=MEMCM01.andersrodland.com",
         "FSP=MEMCM01.andersrodland.com",
-        "DNSSUFFIX=andersrodland.com",
-        "/mp:MEMCM01.andersrodland.com"
+        "DNSSUFFIX=andersrodland.com"
     ],
     "Logging": {
         "Share": "\\\\MEMCM01.andersrodland.com\\ClientHealthLogs$",

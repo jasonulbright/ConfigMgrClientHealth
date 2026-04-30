@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.0.3] - 2026-04-30
+
+### Changed
+- **MP-only ccmsetup resolution** -- `Resolve-Client` no longer reads `Client.Share` when sourcing `ccmsetup.exe`. Configure `Client.ManagementPoints` (array of MP FQDNs) and the script picks one at random, downloads from `http(s)://<MP>/CCM_Client/ccmsetup.exe`, retries the next MP on failure, and injects `SMSMP=`/`/mp:` into the install args at runtime so MPs are maintained in one place.
+- **`Client.MPHttps`** -- new boolean controls HTTP vs HTTPS for the ccmsetup download. Defaults to HTTP.
+- **`Client.Share` deprecated** -- still read for back-compat warning, never used as a download source. Setting it now emits a deprecation warning at reinstall.
+- **Setup wizard** -- prompts for comma-separated MP list and HTTPS y/n. Generated `config.json` writes `Client.ManagementPoints` + `Client.MPHttps`, drops `SMSMP=`/`/mp:` from `ClientInstallProperties` (script injects them at runtime). Wizard validates MP inputs (rejects URL-shaped or whitespace-laden values, rejects empty arrays).
+- **Per-site MP overrides** -- `Sites.<ADSiteName>.ManagementPoints` and `Sites.<ADSiteName>.MPHttps` honored via `Get-SiteConfig`, so each AD site picks from its local MPs without bouncing across WAN.
+
+### Added
+- **Multi-MP random pick with iterate-on-failure** -- a single down MP no longer fails the install if a peer is reachable.
+- **Legacy MP fallback** -- when `Client.ManagementPoints` is missing, the script scrapes any `MP=`, `SMSMP=`, or `/mp:` token from `ClientInstallProperties` so existing configs still work pre-migration.
+- **`Test-ConfigValues` validates Management Points** -- rejects URL-shaped or malformed FQDNs in JSON, site overrides, and the legacy fallback path before they can become download URLs or ccmsetup args.
+- **`ClientHealthDateTimeConverter`** -- API JSON converter accepts the client's `yyyy-MM-dd HH:mm:ss` timestamp format. The minimal-API default JSON binder previously rejected client posts with a 400 before SQL ever saw the row.
+- **`ConvertTo-ConfigBoolean`** helper -- handles the PowerShell `[bool]'False' -> $true` trap when reading XML/JSON booleans.
+
+### Fixed
+- **JSON config cache fallback was unreachable** -- removed the `[ValidateScript({Test-Path})]` attribute on `-Config` so a missing remote config file no longer blocks param binding before the cache lookup runs.
+- **JSON `LocalFiles` was ignored** -- `Get-LocalFilesPath` always read the XML path; now correctly checks `$script:JsonConfig.LocalFiles` first and falls back to the SystemDrive default when blank.
+- **Webservice URL trailing slash** -- `Update-Webservice` now `TrimEnd('/')` before appending the API route, so `-Webservice http://host:5000/` and `-Webservice http://host:5000` both produce a clean `http://host:5000/api/Clients`.
+- **`ccmsetup.exe` could be run from a phantom path** -- old code accepted any directory that existed at `Client.Share` and assumed `ccmsetup.exe` was inside; now verifies the binary is actually present before using it (and the share path is gone entirely from the resolve flow).
+- **SQL migration block** -- `Drivers` column migration was paired with `ALTER COLUMN Build` (re-altering Build twice, never altering Drivers); fixed. DNS / Updates / Services migrations checked `CHARACTER_MAXIMUM_LENGTH = 100` while ALTERing to `200`, making them re-run on every execution; fixed by matching WHERE to the new size. Nullable columns aligned with the original CREATE TABLE schema.
+- **Stripped legacy MP tokens at install time** -- `Resolve-Client` strips `SMSMP=`, `MP=`, and `/mp:` from `ClientInstallProperties` before injecting the picked MP, so legacy configs don't end up sending two different MPs to ccmsetup.
+
+### Removed
+- **Three stranded webservice helpers** -- `Get-ConfigFromWebservice`, `Get-ConfigClientInstallPropertiesFromWebService`, `Get-ConfigServicesFromWebservice`. Defined but never called; targeted routes (`/ConfigurationProfile*`) don't exist on the .NET 10 API surface.
+
+---
+
 ## [1.0.2] - 2026-03-30
 
 ### Added

@@ -11,7 +11,7 @@ BeforeAll {
     $Errors = $null
     $AST = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$Tokens, [ref]$Errors)
 
-    # Dot-source to load functions — the entry point is guarded and won't execute
+    # Dot-source to load functions - the entry point is guarded and won't execute
     . $ScriptPath
 }
 
@@ -27,7 +27,7 @@ Describe 'Script Integrity' {
 
     It 'Defines all expected parameters' {
         $paramNames = $AST.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }
-        $expected = @('SiteCode','SiteServer','Domain','ManagementPoint','SqlServer',
+        $expected = @('SiteCode','SiteServer','Domain','ManagementPoints','MPHttps','SqlServer','SqlAccessPrincipal',
                       'ClientSharePath','LogSharePath','TargetCollection','ClientVersion',
                       'InstallWebservice','WebserviceServer','WebservicePort','SourceRoot','OutputPath')
         foreach ($p in $expected) {
@@ -59,7 +59,7 @@ Describe 'New-ClientHealthConfig' {
         New-ClientHealthConfig `
             -SiteCode 'TST' `
             -Domain 'test.contoso.com' `
-            -ManagementPoint 'mp01.test.contoso.com' `
+            -ManagementPoints @('mp01.test.contoso.com','mp02.test.contoso.com') `
             -SqlServer 'sql01.test.contoso.com' `
             -LogSharePath '\\filesvr\ClientHealthLogs$' `
             -ClientVersion '5.00.9128.1007' `
@@ -84,9 +84,45 @@ Describe 'New-ClientHealthConfig' {
         $config.Client.Version | Should -BeExactly '5.00.9128.1007'
     }
 
-    It 'Sets the management point in ClientInstallProperties' {
-        $mpProp = $config.ClientInstallProperties | Where-Object { $_ -match '^SMSMP=' }
-        $mpProp | Should -BeExactly 'SMSMP=mp01.test.contoso.com'
+    It 'Persists Management Points as a typed array under Client.ManagementPoints' {
+        $config.Client.ManagementPoints.Count | Should -Be 2
+        $config.Client.ManagementPoints | Should -Contain 'mp01.test.contoso.com'
+        $config.Client.ManagementPoints | Should -Contain 'mp02.test.contoso.com'
+    }
+
+    It 'Requires at least one non-empty Management Point' {
+        {
+            New-ClientHealthConfig `
+                -SiteCode 'TST' `
+                -Domain 'test.contoso.com' `
+                -ManagementPoints @('   ') `
+                -SqlServer 'sql01.test.contoso.com' `
+                -LogSharePath '\\filesvr\ClientHealthLogs$' `
+                -ClientVersion '5.00.9128.1007' `
+                -OutputFile (Join-Path $TestDrive 'empty-mp.json')
+        } | Should -Throw '*Management Point is required*'
+    }
+
+    It 'Rejects malformed Management Point values' {
+        {
+            New-ClientHealthConfig `
+                -SiteCode 'TST' `
+                -Domain 'test.contoso.com' `
+                -ManagementPoints @('http://mp01.test.contoso.com') `
+                -SqlServer 'sql01.test.contoso.com' `
+                -LogSharePath '\\filesvr\ClientHealthLogs$' `
+                -ClientVersion '5.00.9128.1007' `
+                -OutputFile (Join-Path $TestDrive 'bad-mp.json')
+        } | Should -Throw '*Invalid Management Point*'
+    }
+
+    It 'Does not bake SMSMP / /mp into ClientInstallProperties (script picks at runtime)' {
+        $mpProp = $config.ClientInstallProperties | Where-Object { $_ -match '^SMSMP=' -or $_ -match '^/mp:' }
+        $mpProp | Should -BeNullOrEmpty
+    }
+
+    It 'Sets MPHttps to false by default' {
+        $config.Client.MPHttps | Should -BeFalse
     }
 
     It 'Does not include /Source in ClientInstallProperties' {
@@ -114,8 +150,8 @@ Describe 'New-ClientHealthConfig' {
         $config.Client.AutoUpgrade | Should -BeTrue
     }
 
-    It 'Has Client.Share empty (ccmsetup comes from MP)' {
-        $config.Client.Share | Should -BeExactly ''
+    It 'Does not write deprecated Client.Share field' {
+        $config.Client.PSObject.Properties.Name | Should -Not -Contain 'Share'
     }
 
     It 'Has 7 services defined' {
@@ -162,6 +198,23 @@ Describe 'Test-SqlConnection' {
     }
 }
 
+Describe 'Test-PortNumber' {
+    It 'Is defined as a function' {
+        Get-Command Test-PortNumber -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Accepts valid TCP ports' {
+        Test-PortNumber -Value '5000' | Should -BeTrue
+        Test-PortNumber -Value '65535' | Should -BeTrue
+    }
+
+    It 'Rejects invalid TCP ports' {
+        Test-PortNumber -Value '0' | Should -BeFalse
+        Test-PortNumber -Value '65536' | Should -BeFalse
+        Test-PortNumber -Value 'abc' | Should -BeFalse
+    }
+}
+
 Describe 'New-FileShare' {
     It 'Is defined as a function' {
         Get-Command New-FileShare -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
@@ -176,6 +229,16 @@ Describe 'New-FileShare' {
         $cmd.Parameters['UncPath'].Attributes |
             Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] -and $_.Mandatory } |
             Should -Not -BeNullOrEmpty
+    }
+
+    It 'Can grant change access for writable log shares' {
+        $cmd = Get-Command New-FileShare
+        $cmd.Parameters.Keys | Should -Contain 'ChangeAccess'
+    }
+
+    It 'Wizard creates the log share with write-capable share permissions' {
+        $scriptContent = Get-Content $ScriptPath -Raw
+        $scriptContent | Should -Match 'New-FileShare\s+-UncPath\s+\$LogSharePath.*-ChangeAccess\s+''Everyone'''
     }
 }
 
@@ -259,6 +322,13 @@ Describe 'New-ClientHealthDatabase' {
                 Should -Not -BeNullOrEmpty -Because "Parameter '$p' should be mandatory"
         }
     }
+
+    It 'Does not grant database access to BUILTIN Users' {
+        $scriptContent = Get-Content $ScriptPath -Raw
+        $scriptContent | Should -Not -Match 'BUILTIN\\Users'
+        $scriptContent | Should -Match 'AccessPrincipal'
+        $scriptContent | Should -Match 'IS_ROLEMEMBER'
+    }
 }
 
 Describe 'Security' {
@@ -310,7 +380,7 @@ Describe 'Generated config compatibility with main script' {
         New-ClientHealthConfig `
             -SiteCode 'TST' `
             -Domain 'test.contoso.com' `
-            -ManagementPoint 'mp01.test.contoso.com' `
+            -ManagementPoints @('mp01.test.contoso.com') `
             -SqlServer 'sql01.test.contoso.com' `
             -LogSharePath '\\filesvr\Logs$' `
             -ClientVersion '5.00.9128.1007' `

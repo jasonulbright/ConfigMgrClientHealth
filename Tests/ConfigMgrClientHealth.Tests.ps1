@@ -72,6 +72,25 @@ Describe 'Security: Parameterized SQL' {
     }
 }
 
+Describe 'REST API Client Compatibility' {
+    BeforeAll {
+        $scriptContent = Get-Content $ScriptPath -Raw
+        $ApiProgramPath = Join-Path $PSScriptRoot '..\Webservice\ClientHealthApi\Program.cs'
+        $ApiConverterPath = Join-Path $PSScriptRoot '..\Webservice\ClientHealthApi\Converters\ClientHealthDateTimeConverter.cs'
+        $ApiProgramContent = Get-Content $ApiProgramPath -Raw
+        $ApiConverterContent = Get-Content $ApiConverterPath -Raw
+    }
+
+    It 'Normalizes Webservice base URI before appending the API route' {
+        $scriptContent | Should -Match '\$URI\.TrimEnd\(''\/''\)'
+    }
+
+    It 'API accepts legacy client timestamp format' {
+        $ApiProgramContent | Should -Match 'ClientHealthDateTimeConverter'
+        $ApiConverterContent | Should -Match 'yyyy-MM-dd HH:mm:ss'
+    }
+}
+
 Describe 'Security: Config Validation' {
     BeforeAll {
         $scriptContent = Get-Content $ScriptPath -Raw
@@ -89,8 +108,65 @@ Describe 'Security: Config Validation' {
         $scriptContent | Should -Match "notmatch\s+'.*\[A-Za-z0-9\].*3"
     }
 
+    It 'Validates management points before URL and ccmsetup use' {
+        $scriptContent | Should -Match 'Invalid management point in config'
+        $scriptContent | Should -Match '\$script:JsonConfig\.Client\.ManagementPoints'
+        $scriptContent | Should -Match '\$script:JsonConfig\.Sites'
+        $scriptContent | Should -Match 'Get-ManagementPointsFromInstallProperties'
+    }
+
     It 'Test-ConfigValues is called after config load' {
         $scriptContent | Should -Match 'Test-ConfigValues\s+-Xml\s+\$Xml'
+    }
+}
+
+Describe 'Config Validation Behavior' {
+    BeforeAll {
+        $scriptText = Get-Content $ScriptPath -Raw
+        $tokens = $null; $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($scriptText, [ref]$tokens, [ref]$errors)
+        $allFns = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+
+        $functionNames = @(
+            'Get-ManagementPointsFromInstallProperties',
+            'Test-ConfigValues'
+        )
+        $extracted = foreach ($fnName in $functionNames) {
+            $node = $allFns | Where-Object { $_.Name -eq $fnName } | Select-Object -First 1
+            if ($node) { $node.Extent.Text }
+        }
+
+        $stubs = @'
+function Get-XMLConfigClientSitecode { return 'TST' }
+function Get-XMLConfigClientDomain { return 'test.contoso.com' }
+'@
+        Invoke-Expression ($stubs + "`n" + ($extracted -join "`n`n"))
+    }
+
+    BeforeEach {
+        $script:JsonConfig = $null
+    }
+
+    It 'Rejects malformed JSON ManagementPoints' {
+        $script:JsonConfig = [pscustomobject]@{
+            Services = @()
+            Client = [pscustomobject]@{ ManagementPoints = @('http://mp01.test.contoso.com') }
+            Sites = $null
+        }
+
+        { Test-ConfigValues } | Should -Throw '*Invalid management point*'
+    }
+
+    It 'Rejects malformed site override ManagementPoints' {
+        $script:JsonConfig = [pscustomobject]@{
+            Services = @()
+            Client = [pscustomobject]@{ ManagementPoints = @('mp01.test.contoso.com') }
+            Sites = [pscustomobject]@{
+                Default = [pscustomobject]@{ ManagementPoints = @('mp 02.test.contoso.com') }
+            }
+        }
+
+        { Test-ConfigValues } | Should -Throw '*Invalid management point*'
     }
 }
 
@@ -293,6 +369,17 @@ Describe 'SQL Schema: CreateDatabase.sql' {
             $SqlContent | Should -Match $param -Because "Column $param should exist in schema"
         }
     }
+
+    It 'Drivers migration alters the Drivers column' {
+        $SqlContent | Should -Match "COLUMN_NAME = 'Drivers'.*ALTER TABLE dbo\.Clients ALTER COLUMN Drivers VARCHAR\(100\) NULL"
+        $SqlContent | Should -Not -Match "COLUMN_NAME = 'Drivers'.*ALTER TABLE dbo\.Clients ALTER COLUMN Build"
+    }
+
+    It 'Variable-width migrations check their target lengths' {
+        $SqlContent | Should -Match "COLUMN_NAME = 'DNS'.*CHARACTER_MAXIMUM_LENGTH = 200.*ALTER TABLE dbo\.Clients ALTER COLUMN DNS VARCHAR\(200\) NULL"
+        $SqlContent | Should -Match "COLUMN_NAME = 'Updates'.*CHARACTER_MAXIMUM_LENGTH = 200.*ALTER TABLE dbo\.Clients ALTER COLUMN Updates VARCHAR\(200\) NULL"
+        $SqlContent | Should -Match "COLUMN_NAME = 'Services'.*CHARACTER_MAXIMUM_LENGTH = 200.*ALTER TABLE dbo\.Clients ALTER COLUMN Services VARCHAR\(200\) NULL"
+    }
 }
 
 Describe 'Script Structure' {
@@ -310,6 +397,15 @@ Describe 'Script Structure' {
 
     It 'Supports -Config parameter' {
         $scriptContent | Should -Match '\[string\]\$Config'
+    }
+
+    It 'Allows missing JSON config path so cache fallback can run' {
+        $configParam = $AST.ParamBlock.Parameters |
+            Where-Object { $_.Name.VariablePath.UserPath -eq 'Config' }
+        $validateScriptAttrs = $configParam.Attributes |
+            Where-Object { $_.TypeName.Name -eq 'ValidateScript' }
+
+        $validateScriptAttrs | Should -BeNullOrEmpty
     }
 
     It 'Supports -Webservice parameter' {
@@ -433,6 +529,27 @@ Describe 'Site-Aware Config' {
         $scriptContent | Should -Match "Get-SiteConfig\s+-PropertyName\s+'ClientShare'"
     }
 
+    It 'Exposes ManagementPoints via Get-XMLConfigManagementPoints with site override' {
+        $scriptContent | Should -Match 'Function Get-XMLConfigManagementPoints'
+        $scriptContent | Should -Match "Get-SiteConfig\s+-PropertyName\s+'ManagementPoints'"
+        $scriptContent | Should -Match '\$script:JsonConfig\.Client\.ManagementPoints'
+    }
+
+    It 'Management point accessor parses legacy install-property forms' {
+        $scriptContent | Should -Match "\^\(SMSMP\|MP\)="
+        $scriptContent | Should -Match '\^/mp:'
+    }
+
+    It 'Exposes MPHttps via Get-XMLConfigMPHttps with site override' {
+        $scriptContent | Should -Match 'Function Get-XMLConfigMPHttps'
+        $scriptContent | Should -Match "Get-SiteConfig\s+-PropertyName\s+'MPHttps'"
+    }
+
+    It 'MPHttps conversion does not treat the string False as true' {
+        $scriptContent | Should -Match 'Function ConvertTo-ConfigBoolean'
+        $scriptContent | Should -Match '\[System\.Convert\]::ToBoolean'
+    }
+
     It 'Log share accessor uses site override' {
         $scriptContent | Should -Match "Get-SiteConfig\s+-PropertyName\s+'LogShare'"
     }
@@ -448,6 +565,10 @@ Describe 'Config Caching' {
         $scriptContent | Should -Match 'config\.json\.cache'
     }
 
+    It 'Uses LocalFiles from JSON config' {
+        $scriptContent | Should -Match '\$script:JsonConfig\.LocalFiles'
+    }
+
     It 'Caches config after successful JSON load' {
         $scriptContent | Should -Match 'Set-Content\s+-Path\s+\$ConfigCachePath'
     }
@@ -458,5 +579,124 @@ Describe 'Config Caching' {
 
     It 'Warns when using cached config' {
         $scriptContent | Should -Match 'Write-Warning.*cached config'
+    }
+}
+
+Describe 'Client Install Source Resolution' {
+    BeforeAll {
+        $scriptContent = Get-Content (Join-Path $PSScriptRoot '..\ConfigMgrClientHealth.ps1') -Raw
+    }
+
+    It 'Sources ccmsetup.exe only from MP HTTP, never from Client.Share' {
+        $scriptContent | Should -Not -Match 'Test-Path \$ClientShare\b'
+        $scriptContent | Should -Not -Match 'Join-Path\s+\$ClientShare\s+''ccmsetup\.exe'''
+    }
+
+    It 'Errors out when no Management Points are configured' {
+        $scriptContent | Should -Match 'no Management Points are configured'
+    }
+
+    It 'Warns when Client.Share is set (deprecated path)' {
+        $scriptContent | Should -Match 'is deprecated'
+    }
+
+    It 'Shuffles MPs and iterates on download failure' {
+        $scriptContent | Should -Match 'Get-Random -Count'
+        $scriptContent | Should -Match 'foreach \(\$candidate in \$shuffled\)'
+        $scriptContent | Should -Match 'attemptErrors'
+    }
+
+    It 'Honors MPHttps for download scheme' {
+        $scriptContent | Should -Match "if \(\`$useHttps\) \{ 'https' \} else \{ 'http' \}"
+    }
+
+    It 'Strips stale MP / SMSMP / /mp tokens before injecting the picked MP' {
+        $scriptContent | Should -Match '\$_ -notmatch ''\^\(SMSMP\|MP\)='''
+        $scriptContent | Should -Match '\$_ -notmatch ''\^/mp:'''
+        $scriptContent | Should -Match '\$tokens \+= "SMSMP=\$selectedMp"'
+        $scriptContent | Should -Match '\$tokens \+= "/mp:\$selectedMp"'
+    }
+}
+
+Describe 'MP Resolution Behavior' {
+    BeforeAll {
+        $scriptPath = Join-Path $PSScriptRoot '..\ConfigMgrClientHealth.ps1'
+        $scriptText = Get-Content $scriptPath -Raw
+
+        # Extract just the helper functions we want to behavior-test in isolation.
+        $functionNames = @(
+            'Get-XMLConfigManagementPoints',
+            'Get-XMLConfigMPHttps',
+            'Get-ManagementPointsFromInstallProperties',
+            'ConvertTo-ConfigBoolean',
+            'Get-SiteConfig',
+            'Get-XMLConfigClientShare',
+            'Get-ClientSiteName'
+        )
+        $tokens = $null; $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($scriptText, [ref]$tokens, [ref]$errors)
+        $allFns = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+
+        $extracted = foreach ($fnName in $functionNames) {
+            $node = $allFns | Where-Object { $_.Name -eq $fnName } | Select-Object -First 1
+            if ($node) { $node.Extent.Text }
+        }
+        $isolated = ($extracted -join "`n`n")
+        # Stub Get-ClientSiteName so Get-SiteConfig doesn't try to read AD
+        $isolated = "function Get-ClientSiteName { return '_none_' }`n" + ($extracted | Where-Object { $_ -notmatch 'function Get-ClientSiteName' }) -join "`n`n"
+        Invoke-Expression $isolated
+    }
+
+    BeforeEach {
+        $script:JsonConfig = $null
+        $script:ResolvedADSite = $null
+        $config = $null
+    }
+
+    It 'Returns explicit ManagementPoints array from JSON' {
+        $script:JsonConfig = [pscustomobject]@{
+            Client = [pscustomobject]@{ ManagementPoints = @('mp1.contoso.com','mp2.contoso.com') }
+            Sites = $null
+        }
+        $result = Get-XMLConfigManagementPoints
+        $result.Count | Should -Be 2
+        $result | Should -Contain 'mp1.contoso.com'
+        $result | Should -Contain 'mp2.contoso.com'
+    }
+
+    It 'Falls back to legacy MP tokens in ClientInstallProperties when ManagementPoints missing' {
+        $script:JsonConfig = [pscustomobject]@{
+            Client = [pscustomobject]@{ ManagementPoints = $null }
+            ClientInstallProperties = @('SMSSITECODE=ABC','MP=legacy.contoso.com','/mp:legacy.contoso.com','SMSMP=legacy.contoso.com')
+            Sites = $null
+        }
+        $result = @(Get-XMLConfigManagementPoints)
+        $result.Count | Should -Be 1
+        $result[0] | Should -Be 'legacy.contoso.com'
+    }
+
+    It 'Returns empty array when nothing is configured' {
+        $script:JsonConfig = [pscustomobject]@{
+            Client = [pscustomobject]@{ ManagementPoints = $null }
+            ClientInstallProperties = @('SMSSITECODE=ABC')
+            Sites = $null
+        }
+        $result = Get-XMLConfigManagementPoints
+        @($result).Count | Should -Be 0
+    }
+
+    It 'MPHttps defaults to false when not set' {
+        $script:JsonConfig = [pscustomobject]@{ Client = [pscustomobject]@{}; Sites = $null }
+        Get-XMLConfigMPHttps | Should -BeFalse
+    }
+
+    It 'MPHttps returns true when explicitly set' {
+        $script:JsonConfig = [pscustomobject]@{ Client = [pscustomobject]@{ MPHttps = $true }; Sites = $null }
+        Get-XMLConfigMPHttps | Should -BeTrue
+    }
+
+    It 'MPHttps returns false when set as the string False' {
+        $script:JsonConfig = [pscustomobject]@{ Client = [pscustomobject]@{ MPHttps = 'False' }; Sites = $null }
+        Get-XMLConfigMPHttps | Should -BeFalse
     }
 }

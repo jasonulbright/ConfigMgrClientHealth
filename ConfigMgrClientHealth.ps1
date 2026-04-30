@@ -42,7 +42,6 @@
 [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact="Medium")]
 param(
     [Parameter(HelpMessage='Path to JSON or XML configuration file')]
-    [ValidateScript({Test-Path -Path $_ -PathType Leaf})]
     [ValidatePattern('\.(xml|json)$')]
     [string]$Config,
     [Parameter(HelpMessage='URI to ConfigMgr Client Health Webservice')]
@@ -156,7 +155,7 @@ Begin {
             }
         }
         elseif (($Config -match '\.json$') -and (Test-Path $ConfigCachePath)) {
-            # Network config unreachable — fall back to cached copy
+            # Network config unreachable - fall back to cached copy
             try {
                 $script:JsonConfig = Get-Content -Path $ConfigCachePath -Raw | ConvertFrom-Json
                 Write-Warning "Config file '$Config' not accessible. Using cached config from $ConfigCachePath"
@@ -218,10 +217,10 @@ Begin {
         Param([Parameter(Mandatory=$true)][String]$URI, $Log)
 
         $Obj = $Log | ConvertTo-Json
-        $ApiUri = "$URI/api/Clients"
+        $ApiUri = "$($URI.TrimEnd('/'))/api/Clients"
         $ContentType = "application/json"
 
-        # POST with UPSERT — the API handles create-or-update
+        # POST with UPSERT - the API handles create-or-update
         try {
             Invoke-WithRetry -OperationName 'Webservice POST' -ScriptBlock {
                 Invoke-RestMethod -Method POST -Uri $ApiUri -Body $Obj -ContentType $ContentType | Out-Null
@@ -233,82 +232,6 @@ Begin {
             Write-Warning "Error updating webservice at $ApiUri : $ExceptionMessage"
             Out-LogFile -Xml $Xml -Text "ERROR Webservice POST: $ExceptionMessage" -Severity 3
         }
-    }
-
-    # Retrieve configuration from SQL using webserivce
-    Function Get-ConfigFromWebservice {
-        Param(
-            [Parameter(Mandatory=$true)][String]$URI,
-            [Parameter(Mandatory=$false)][String]$ProfileID
-            )
-
-        $URI = $URI + "/ConfigurationProfile"
-        #Write-Host "ProfileID = $ProfileID"
-        if ($ProfileID -ge 0) { $URI = $URI + "/$ProfileID"}
-
-        Write-Verbose "Retrieving configuration from webservice. URI: $URI"
-        try {
-            $Obj = Invoke-RestMethod -Uri $URI
-        }
-        catch {
-            Write-Host "Error retrieving configuration from webservice $URI. Exception: $ExceptionMessage" -ForegroundColor Red
-            Exit 1
-        }
-
-        Write-Output $Obj
-    }
-
-    Function Get-ConfigClientInstallPropertiesFromWebService {
-        Param(
-            [Parameter(Mandatory=$true)][String]$URI,
-            [Parameter(Mandatory=$true)][String]$ProfileID
-            )
-
-            $URI = $URI + "/ClientInstallProperties"
-
-            Write-Verbose "Retrieving client install properties from webservice"
-        try {
-            $CIP = Invoke-RestMethod -Uri $URI
-        }
-        catch {
-            Write-Host "Error retrieving client install properties from webservice $URI. Exception: $ExceptionMessage" -ForegroundColor Red
-            Exit 1
-        }
-
-        $string = $CIP | Where-Object {$_.profileId -eq $ProfileID} | Select-Object -ExpandProperty cmd
-        $obj = ""
-
-        foreach ($i in $string) {
-            $obj += $i + " "
-        }
-
-        # Remove the trailing space from the last parameter caused by the foreach loop
-        $obj = $obj.Substring(0,$obj.Length-1)
-        Write-Output $Obj
-    }
-
-    Function Get-ConfigServicesFromWebservice {
-        Param(
-            [Parameter(Mandatory=$true)][String]$URI,
-            [Parameter(Mandatory=$true)][String]$ProfileID
-            )
-
-            $URI = $URI + "/ConfigurationProfileServices"
-
-            Write-Verbose "Retrieving client install properties from webservice"
-        try {
-            $CS = Invoke-RestMethod -Uri $URI
-        }
-        catch {
-            Write-Host "Error retrieving client install properties from webservice $URI. Exception: $ExceptionMessage" -ForegroundColor Red
-            Exit 1
-        }
-
-        $obj = $CS | Where-Object {$_.profileId -eq $ProfileID} | Select-Object Name, StartupType, State, Uptime
-
-
-
-        Write-Output $Obj
     }
 
     Function Get-LogFileName {
@@ -1613,56 +1536,65 @@ Begin {
             [Parameter(Mandatory=$false)]$FirstInstall=$false
             )
 
-        # Resolve ccmsetup.exe: configured share > download from MP > error
-        $ClientShare = Get-XMLConfigClientShare
+        # Source of truth for ccmsetup.exe is the MP. Random-pick from configured list,
+        # iterate on failure so a single down MP doesn't sink the install.
+        $mps = @(Get-XMLConfigManagementPoints | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if (-not $mps -or $mps.Count -eq 0) {
+            Write-Error 'ERROR: Client tagged for reinstall, but no Management Points are configured. Set Client.ManagementPoints in config (array of MP FQDNs).'
+            Exit 1
+        }
+
+        # Deprecation warning: Client.Share is no longer used for ccmsetup resolution.
+        $deprecatedShare = Get-XMLConfigClientShare
+        if (-not [string]::IsNullOrWhiteSpace($deprecatedShare)) {
+            Write-Warning "Client.Share ('$deprecatedShare') is deprecated. ccmsetup.exe is sourced from the MP. Remove the Share field from config to silence this warning."
+        }
+
+        $useHttps = Get-XMLConfigMPHttps
+        $scheme = if ($useHttps) { 'https' } else { 'http' }
+
+        $shuffled = @($mps | Get-Random -Count $mps.Count)
+        $tempDir = Join-Path $env:TEMP 'ConfigMgrClientHealth'
+        if (-not (Test-Path $tempDir)) { New-Item -Path $tempDir -ItemType Directory -Force | Out-Null }
+        $tempCcmSetup = Join-Path $tempDir 'ccmsetup.exe'
         $ccmSetupPath = $null
+        $selectedMp = $null
+        $attemptErrors = @()
 
-        # Option 1: Configured file share
-        if (-not [string]::IsNullOrWhiteSpace($ClientShare) -and (Test-Path $ClientShare -ErrorAction SilentlyContinue)) {
-            $ccmSetupPath = Join-Path $ClientShare 'ccmsetup.exe'
-            Write-Verbose "Using ccmsetup.exe from configured share: $ClientShare"
-        }
-
-        # Option 2: Download fresh from Management Point
-        if (-not $ccmSetupPath) {
-            # Parse MP from ClientInstallProperties (SMSMP=server or /mp:server)
-            $mpFqdn = $null
-            foreach ($token in ($ClientInstallProperties -split '\s+')) {
-                if ($token -match '^SMSMP=(.+)$')  { $mpFqdn = $Matches[1]; break }
-                if ($token -match '^/mp:(.+)$')    { $mpFqdn = $Matches[1]; break }
-            }
-
-            if ($mpFqdn) {
-                $downloadUrl = "http://$mpFqdn/CCM_Client/ccmsetup.exe"
-                $tempDir = Join-Path $env:TEMP 'ConfigMgrClientHealth'
-                if (-not (Test-Path $tempDir)) { New-Item -Path $tempDir -ItemType Directory -Force | Out-Null }
-                $tempCcmSetup = Join-Path $tempDir 'ccmsetup.exe'
-
-                try {
-                    Write-Verbose "Downloading ccmsetup.exe from MP: $downloadUrl"
-                    Invoke-WebRequest -Uri $downloadUrl -OutFile $tempCcmSetup -UseBasicParsing -ErrorAction Stop
-                    if (Test-Path $tempCcmSetup) {
-                        $ccmSetupPath = $tempCcmSetup
-                        Write-Output "Downloaded ccmsetup.exe from Management Point: $mpFqdn"
-                    }
-                }
-                catch {
-                    Write-Warning "Failed to download ccmsetup.exe from $downloadUrl : $_"
+        foreach ($candidate in $shuffled) {
+            $downloadUrl = "$($scheme)://$candidate/CCM_Client/ccmsetup.exe"
+            try {
+                if (Test-Path $tempCcmSetup) { Remove-Item $tempCcmSetup -Force -ErrorAction SilentlyContinue }
+                Write-Verbose "Downloading ccmsetup.exe from MP: $downloadUrl"
+                Invoke-WebRequest -Uri $downloadUrl -OutFile $tempCcmSetup -UseBasicParsing -ErrorAction Stop
+                if (Test-Path $tempCcmSetup -PathType Leaf) {
+                    $ccmSetupPath = $tempCcmSetup
+                    $selectedMp = $candidate
+                    Write-Output "Downloaded ccmsetup.exe from Management Point: $candidate"
+                    break
                 }
             }
-            else {
-                Write-Warning "No MP= or /MP: found in ClientInstallProperties. Cannot download ccmsetup.exe from Management Point."
+            catch {
+                $attemptErrors += "${candidate}: $($_.Exception.Message)"
+                Write-Warning "Failed to download ccmsetup.exe from $downloadUrl : $($_.Exception.Message)"
             }
         }
 
         if (-not $ccmSetupPath) {
-            $text = 'ERROR: Client tagged for reinstall, but ccmsetup.exe not available. '
-            if (-not [string]::IsNullOrWhiteSpace($ClientShare)) { $text += "Share not accessible: $ClientShare. " }
-            $text += 'Download from MP failed or no MP configured. '
-            $text += 'Set MP= or /MP: in ClientInstallProperties, or configure Client.Share with a reachable UNC path.'
+            $text = 'ERROR: Client tagged for reinstall, but ccmsetup.exe could not be downloaded from any configured MP. '
+            $text += "Tried: $([string]::Join('; ', $attemptErrors))"
             Write-Error $text
             Exit 1
         }
+
+        # Inject the picked MP into install args; strip any stale MP / SMSMP / /mp tokens from the
+        # config-supplied property string so the user only maintains one source of truth.
+        $tokens = @($ClientInstallProperties -split '\s+' | Where-Object {
+            $_ -and ($_ -notmatch '^(SMSMP|MP)=') -and ($_ -notmatch '^/mp:')
+        })
+        $tokens += "SMSMP=$selectedMp"
+        $tokens += "/mp:$selectedMp"
+        $ClientInstallProperties = [string]::Join(' ', $tokens)
 
         if ($FirstInstall -eq $true) { $text = 'Installing Configuration Manager Client.' }
         else { $text = 'Client tagged for reinstall. Reinstalling client...' }
@@ -2599,11 +2531,16 @@ Begin {
 
     # Start Getters - XML config file
     Function Get-LocalFilesPath {
-        if ($config) {
+        if ($script:JsonConfig) {
+            $obj = [string]$script:JsonConfig.LocalFiles
+        }
+        elseif ($config) {
             $obj = $Xml.Configuration.LocalFiles
         }
-        $obj = $ExecutionContext.InvokeCommand.ExpandString($obj)
-        if ($obj -eq $null) { $obj = Join-path $env:SystemDrive "ClientHealth" }
+        if (-not [string]::IsNullOrWhiteSpace($obj)) {
+            $obj = $ExecutionContext.InvokeCommand.ExpandString($obj)
+        }
+        if ([string]::IsNullOrWhiteSpace($obj)) { $obj = Join-path $env:SystemDrive "ClientHealth" }
         Return $obj
     }
 
@@ -2688,18 +2625,88 @@ Begin {
     }
 
     Function Get-XMLConfigClientShare {
+        # DEPRECATED. Retained for back-compat detection only; ccmsetup.exe is sourced from MP HTTP, not a share.
         if ($script:JsonConfig) {
             $siteOverride = Get-SiteConfig -PropertyName 'ClientShare'
             if ($siteOverride) { return $siteOverride }
-            $obj = $script:JsonConfig.Client.Share
-            if (!$obj) { $obj = $global:ScriptPath }
-            return $obj
+            return [string]$script:JsonConfig.Client.Share
         }
         if ($config) {
             $obj = $Xml.Configuration.Client | Where-Object {$_.Name -like 'Share'} | Select-Object -ExpandProperty '#text' -ErrorAction SilentlyContinue
         }
-        if(!($obj)){$obj=$global:ScriptPath} #If Client share is empty, default to the script folder.
-        Write-Output $obj
+        return [string]$obj
+    }
+
+    Function Get-ManagementPointsFromInstallProperties {
+        Param([Parameter(Mandatory=$false)]$InstallProperties)
+
+        $mpList = @()
+        foreach ($property in @($InstallProperties)) {
+            $value = [string]$property
+            $mp = $null
+
+            if ($value -match '^(SMSMP|MP)=(.+)$') { $mp = $Matches[2] }
+            elseif ($value -match '^/mp:(.+)$') { $mp = $Matches[1] }
+
+            if ($mp) {
+                $mp = $mp.Trim().Trim('"')
+                if (-not [string]::IsNullOrWhiteSpace($mp) -and $mpList -notcontains $mp) {
+                    $mpList += $mp
+                }
+            }
+        }
+
+        return $mpList
+    }
+
+    Function ConvertTo-ConfigBoolean {
+        Param(
+            [Parameter(Mandatory=$false)]$Value,
+            [bool]$Default = $false
+        )
+
+        if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $Default }
+        if ($Value -is [bool]) { return $Value }
+
+        try { return [System.Convert]::ToBoolean([string]$Value) }
+        catch { return $Default }
+    }
+
+    Function Get-XMLConfigManagementPoints {
+        # Returns an array of MP FQDNs for ccmsetup.exe download. Site-aware in JSON mode.
+        # Falls back to legacy MP/SMSMP install tokens when no explicit list is configured.
+        if ($script:JsonConfig) {
+            $siteOverride = Get-SiteConfig -PropertyName 'ManagementPoints'
+            if ($siteOverride) { return @($siteOverride) }
+            $mps = $script:JsonConfig.Client.ManagementPoints
+            if ($mps) { return @($mps) }
+            return Get-ManagementPointsFromInstallProperties -InstallProperties $script:JsonConfig.ClientInstallProperties
+        }
+        if ($config) {
+            $mpList = @()
+            $mpRoot = $Xml.Configuration.ManagementPoints
+            if ($mpRoot) {
+                foreach ($node in $mpRoot.MP) { if ($node) { $mpList += [string]$node } }
+            }
+            if (-not $mpList) {
+                $mpList = Get-ManagementPointsFromInstallProperties -InstallProperties $Xml.Configuration.ClientInstallProperty
+            }
+            return $mpList
+        }
+        return @()
+    }
+
+    Function Get-XMLConfigMPHttps {
+        if ($script:JsonConfig) {
+            $siteOverride = Get-SiteConfig -PropertyName 'MPHttps'
+            if ($null -ne $siteOverride) { return ConvertTo-ConfigBoolean -Value $siteOverride }
+            return ConvertTo-ConfigBoolean -Value $script:JsonConfig.Client.MPHttps
+        }
+        if ($config) {
+            $obj = $Xml.Configuration.Client | Where-Object {$_.Name -like 'MPHttps'} | Select-Object -ExpandProperty '#text' -ErrorAction SilentlyContinue
+            if ($obj) { return ConvertTo-ConfigBoolean -Value $obj }
+        }
+        return $false
     }
 
     Function Get-XMLConfigUpdatesShare {
@@ -3385,6 +3392,15 @@ Begin {
     Function Test-ConfigValues {
         Param([Parameter(Mandatory=$false)]$Xml)
 
+        Function Test-ManagementPointName {
+            Param([Parameter(Mandatory=$false)][string]$ManagementPoint)
+
+            if ([string]::IsNullOrWhiteSpace($ManagementPoint)) { return $false }
+            if ($ManagementPoint -notmatch '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$') { return $false }
+            if ($ManagementPoint -match '\.\.') { return $false }
+            return $true
+        }
+
         # Validate service names (used in WMI filters)
         if ($script:JsonConfig) {
             foreach ($svc in $script:JsonConfig.Services) {
@@ -3411,6 +3427,33 @@ Begin {
         $domain = Get-XMLConfigClientDomain
         if ($domain -and $domain -notmatch '^[a-zA-Z0-9\.\-]+$') {
             throw "Invalid domain in config: '$domain'. Contains unexpected characters."
+        }
+
+        # Validate management points before they are used in download URLs and ccmsetup args
+        $managementPoints = @()
+        if ($script:JsonConfig) {
+            $managementPoints += @($script:JsonConfig.Client.ManagementPoints)
+            if ($script:JsonConfig.Sites) {
+                foreach ($site in @($script:JsonConfig.Sites.PSObject.Properties)) {
+                    if ($site.Value.PSObject.Properties['ManagementPoints']) {
+                        $managementPoints += @($site.Value.ManagementPoints)
+                    }
+                }
+            }
+        }
+        else {
+            $mpRoot = $Xml.Configuration.ManagementPoints
+            if ($mpRoot) {
+                foreach ($node in @($mpRoot.MP)) { if ($node) { $managementPoints += [string]$node } }
+            }
+            $managementPoints += Get-ManagementPointsFromInstallProperties -InstallProperties $Xml.Configuration.ClientInstallProperty
+        }
+
+        foreach ($mp in @($managementPoints | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)) {
+            $mp = ([string]$mp).Trim()
+            if (-not (Test-ManagementPointName -ManagementPoint $mp)) {
+                throw "Invalid management point in config: '$mp'. Use a hostname or FQDN containing only letters, numbers, hyphen, and dot."
+            }
         }
 
         Write-Verbose "Config validation passed"

@@ -17,7 +17,7 @@
 .EXAMPLE
     # Non-interactive for automation / testing:
     .\Install-ClientHealth.ps1 -SiteCode 'MCM' -SiteServer 'sccm01.contoso.com' `
-        -Domain 'contoso.com' -ManagementPoint 'sccm01.contoso.com' `
+        -Domain 'contoso.com' -ManagementPoints 'sccm01.contoso.com','sccm02.contoso.com' `
         -SqlServer 'sccmdbs.contoso.com' -ClientSharePath '\\fileshare\ClientHealth$' `
         -LogSharePath '\\fileshare\ClientHealthLogs$' -TargetCollection 'All Systems' `
         -ClientVersion '5.00.9128.1007'
@@ -32,8 +32,10 @@ param(
     [string]$SiteCode,
     [string]$SiteServer,
     [string]$Domain,
-    [string]$ManagementPoint,
+    [string[]]$ManagementPoints,
+    [bool]$MPHttps = $false,
     [string]$SqlServer,
+    [string]$SqlAccessPrincipal,
     [string]$ClientSharePath,
     [string]$LogSharePath,
     [string]$TargetCollection = 'All Systems',
@@ -107,6 +109,35 @@ function Test-SqlConnection {
     catch { return $false }
 }
 
+function Test-PortNumber {
+    param([string]$Value)
+
+    $port = 0
+    return [int]::TryParse($Value, [ref]$port) -and $port -gt 0 -and $port -le 65535
+}
+
+function Test-ManagementPointName {
+    param(
+        [string]$Value,
+        [switch]$RequireFqdn
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $hostName = $Value.Trim()
+    if ($hostName -notmatch '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$') { return $false }
+    if ($hostName -match '\.\.') { return $false }
+    if ($RequireFqdn -and $hostName -notmatch '\.') { return $false }
+    return $true
+}
+
+function Get-DefaultSqlAccessPrincipal {
+    if ($env:USERDOMAIN -and $env:USERDOMAIN -ne $env:COMPUTERNAME) {
+        return "$env:USERDOMAIN\Domain Computers"
+    }
+
+    return ''
+}
+
 function New-ClientHealthConfig {
     <#
     .SYNOPSIS
@@ -115,30 +146,44 @@ function New-ClientHealthConfig {
     param(
         [Parameter(Mandatory)][string]$SiteCode,
         [Parameter(Mandatory)][string]$Domain,
-        [Parameter(Mandatory)][string]$ManagementPoint,
+        [Parameter(Mandatory)][string[]]$ManagementPoints,
         [Parameter(Mandatory)][string]$SqlServer,
         [Parameter(Mandatory)][string]$LogSharePath,
         [Parameter(Mandatory)][string]$ClientVersion,
+        [bool]$MPHttps = $false,
         [Parameter(Mandatory)][string]$OutputFile
     )
+
+    $ManagementPoints = @(
+        $ManagementPoints | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($ManagementPoints.Count -eq 0) {
+        throw 'At least one Management Point is required.'
+    }
+    foreach ($mp in $ManagementPoints) {
+        if (-not (Test-ManagementPointName -Value $mp -RequireFqdn)) {
+            throw "Invalid Management Point '$mp'. Use a fully qualified domain name."
+        }
+    }
+
+    $primaryMp = $ManagementPoints[0]
 
     $config = [ordered]@{
         LocalFiles             = 'C:\ProgramData\ConfigMgrClientHealth'
         Client                 = [ordered]@{
-            Version     = $ClientVersion
-            SiteCode    = $SiteCode
-            Domain      = $Domain
-            AutoUpgrade = $true
-            Share       = ''
-            Cache       = [ordered]@{ Size = 16384; DeleteOrphanedData = $true; Enable = $true }
-            Log         = [ordered]@{ MaxSize = 4096; MaxHistory = 2; Enable = $true }
+            Version          = $ClientVersion
+            SiteCode         = $SiteCode
+            Domain           = $Domain
+            AutoUpgrade      = $true
+            ManagementPoints = @($ManagementPoints)
+            MPHttps          = $MPHttps
+            Cache            = [ordered]@{ Size = 16384; DeleteOrphanedData = $true; Enable = $true }
+            Log              = [ordered]@{ MaxSize = 4096; MaxHistory = 2; Enable = $true }
         }
         ClientInstallProperties = @(
             "SMSSITECODE=$SiteCode",
-            "SMSMP=$ManagementPoint",
-            "FSP=$ManagementPoint",
-            "DNSSUFFIX=$Domain",
-            "/mp:$ManagementPoint"
+            "FSP=$primaryMp",
+            "DNSSUFFIX=$Domain"
         )
         Logging                = [ordered]@{
             Share        = $LogSharePath
@@ -197,7 +242,8 @@ function New-ClientHealthDatabase {
     #>
     param(
         [Parameter(Mandatory)][string]$SqlServer,
-        [Parameter(Mandatory)][string]$SqlScriptPath
+        [Parameter(Mandatory)][string]$SqlScriptPath,
+        [string]$AccessPrincipal = (Get-DefaultSqlAccessPrincipal)
     )
 
     if (-not (Get-Module -ListAvailable -Name SqlServer) -and
@@ -216,15 +262,23 @@ function New-ClientHealthDatabase {
         Invoke-Sqlcmd -ServerInstance $SqlServer -Query $batch -ErrorAction Stop
     }
 
-    # Grant Domain Computers access
+    if ([string]::IsNullOrWhiteSpace($AccessPrincipal)) {
+        throw "SQL access principal is required. Use a domain group such as 'CONTOSO\Domain Computers'."
+    }
+
+    # Grant client computer access
+    $principalName = $AccessPrincipal.Replace("'", "''")
+    $principalIdentifier = $AccessPrincipal.Replace(']', ']]')
     $grantSql = @"
 USE ClientHealth;
-IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE name = 'BUILTIN\Users')
-    CREATE LOGIN [BUILTIN\Users] FROM WINDOWS;
-IF NOT EXISTS (SELECT * FROM sys.database_principals WHERE name = 'BUILTIN\Users')
-    CREATE USER [BUILTIN\Users] FOR LOGIN [BUILTIN\Users];
-ALTER ROLE db_datareader ADD MEMBER [BUILTIN\Users];
-ALTER ROLE db_datawriter ADD MEMBER [BUILTIN\Users];
+IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE name = N'$principalName')
+    CREATE LOGIN [$principalIdentifier] FROM WINDOWS;
+IF NOT EXISTS (SELECT * FROM sys.database_principals WHERE name = N'$principalName')
+    CREATE USER [$principalIdentifier] FOR LOGIN [$principalIdentifier];
+IF IS_ROLEMEMBER('db_datareader', N'$principalName') = 0
+    ALTER ROLE db_datareader ADD MEMBER [$principalIdentifier];
+IF IS_ROLEMEMBER('db_datawriter', N'$principalName') = 0
+    ALTER ROLE db_datawriter ADD MEMBER [$principalIdentifier];
 "@
     Invoke-Sqlcmd -ServerInstance $SqlServer -Query $grantSql -ErrorAction Stop
 }
@@ -237,7 +291,9 @@ function New-FileShare {
     #>
     param(
         [Parameter(Mandatory)][string]$UncPath,
-        [string]$Description = 'ConfigMgr Client Health'
+        [string]$Description = 'ConfigMgr Client Health',
+        [string[]]$ReadAccess = @('Everyone'),
+        [string[]]$ChangeAccess = @()
     )
 
     # Parse \\server\share from UNC
@@ -265,11 +321,34 @@ function New-FileShare {
         Write-Host "  Created directory: $localDir" -ForegroundColor Green
     }
 
+    if ($ChangeAccess.Count -gt 0) {
+        $acl = Get-Acl -Path $localDir
+        foreach ($principal in $ChangeAccess) {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $principal,
+                'Modify',
+                'ContainerInherit,ObjectInherit',
+                'None',
+                'Allow'
+            )
+            $acl.SetAccessRule($rule)
+        }
+        Set-Acl -Path $localDir -AclObject $acl
+    }
+
     # Create SMB share
     $existingShare = Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue
     if (-not $existingShare) {
-        New-SmbShare -Name $shareName -Path $localDir -Description $Description `
-            -FullAccess 'Administrators' -ReadAccess 'Everyone' | Out-Null
+        $shareParams = @{
+            Name        = $shareName
+            Path        = $localDir
+            Description = $Description
+            FullAccess  = 'Administrators'
+        }
+        if ($ChangeAccess.Count -gt 0) { $shareParams.ChangeAccess = $ChangeAccess }
+        elseif ($ReadAccess.Count -gt 0) { $shareParams.ReadAccess = $ReadAccess }
+
+        New-SmbShare @shareParams | Out-Null
         Write-Host "  Created share: \\$env:COMPUTERNAME\$shareName" -ForegroundColor Green
     }
 }
@@ -529,8 +608,10 @@ function Start-ClientHealthWizard {
         [string]$SiteCode,
         [string]$SiteServer,
         [string]$Domain,
-        [string]$ManagementPoint,
+        [string[]]$ManagementPoints,
+        [bool]$MPHttps = $false,
         [string]$SqlServer,
+        [string]$SqlAccessPrincipal,
         [string]$ClientSharePath,
         [string]$LogSharePath,
         [string]$TargetCollection = 'All Systems',
@@ -573,15 +654,27 @@ function Start-ClientHealthWizard {
             -Validate { param($v) $v -match '\.' } `
             -ErrorMessage 'Domain should contain at least one dot (e.g. contoso.com).'
 
-        $ManagementPoint = Read-ValidatedHost -Prompt 'Management Point FQDN' `
+        $mpInput = Read-ValidatedHost -Prompt 'Management Point FQDN(s) - comma-separated for multi-MP' `
             -Default $SiteServer `
-            -Validate { param($v) $v -match '\.' } `
-            -ErrorMessage 'Please provide a fully qualified domain name.'
+            -Validate { param($v) $items = @($v -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }); $items.Count -gt 0 -and (($items | Where-Object { -not (Test-ManagementPointName -Value $_ -RequireFqdn) }).Count -eq 0) } `
+            -ErrorMessage 'Each MP must be a fully qualified domain name.'
+        $ManagementPoints = @($mpInput -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+        $httpsAnswer = Read-ValidatedHost -Prompt 'Download ccmsetup.exe over HTTPS? (y/n)' `
+            -Default 'n' `
+            -Validate { param($v) $v -match '^[yn]$' } `
+            -ErrorMessage 'Enter y or n.'
+        $MPHttps = ($httpsAnswer -eq 'y')
 
         $SqlServer = Read-ValidatedHost -Prompt 'SQL Server for ClientHealth database' `
             -Default $SiteServer `
             -Validate { param($v) Test-SqlConnection $v } `
             -ErrorMessage 'Cannot connect to SQL Server. Verify the server name and that your account has access.'
+
+        $SqlAccessPrincipal = Read-ValidatedHost -Prompt 'SQL principal for client database writes' `
+            -Default (Get-DefaultSqlAccessPrincipal) `
+            -Validate { param($v) $v -match '^[^\\]+\\[^\\]+$' } `
+            -ErrorMessage 'Use DOMAIN\Group format, for example CONTOSO\Domain Computers.'
 
         $ClientSharePath = Read-ValidatedHost -Prompt 'Client share UNC path (e.g. \\server\ClientHealth$)' `
             -Validate { param($v) $v -match '^\\\\[^\\]+\\[^\\]+' } `
@@ -610,7 +703,7 @@ function Start-ClientHealthWizard {
                 -Default $SiteServer
             $portStr = Read-ValidatedHost -Prompt 'Webservice port' `
                 -Default '5000' `
-                -Validate { param($v) [int]::TryParse($v, [ref]$null) -and [int]$v -gt 0 -and [int]$v -le 65535 } `
+                -Validate { param($v) Test-PortNumber $v } `
                 -ErrorMessage 'Must be a valid port number (1-65535).'
             $WebservicePort = [int]$portStr
         }
@@ -620,8 +713,10 @@ function Start-ClientHealthWizard {
         Write-Host "  Site Code:          $SiteCode"
         Write-Host "  Site Server:        $SiteServer"
         Write-Host "  Domain:             $Domain"
-        Write-Host "  Management Point:   $ManagementPoint"
+        Write-Host "  Management Points:  $([string]::Join(', ', $ManagementPoints))"
+        Write-Host "  MP Scheme:          $(if ($MPHttps) { 'HTTPS' } else { 'HTTP' })"
         Write-Host "  SQL Server:         $SqlServer"
+        Write-Host "  SQL Access:         $SqlAccessPrincipal"
         Write-Host "  Client Share:       $ClientSharePath"
         Write-Host "  Log Share:          $LogSharePath"
         Write-Host "  Target Collection:  $TargetCollection"
@@ -645,17 +740,18 @@ function Start-ClientHealthWizard {
 
     $configFile = Join-Path $OutputPath 'config.json'
     New-ClientHealthConfig -SiteCode $SiteCode -Domain $Domain `
-        -ManagementPoint $ManagementPoint -SqlServer $SqlServer `
+        -ManagementPoints $ManagementPoints -SqlServer $SqlServer `
         -LogSharePath $LogSharePath -ClientVersion $ClientVersion `
-        -OutputFile $configFile
+        -MPHttps:$MPHttps -OutputFile $configFile
     Write-Host "  Config generated: $configFile" -ForegroundColor Green
 
     # ── Phase 3: Create database ──
     Write-Banner 'Phase 3: Creating ClientHealth Database'
+    if (-not $SqlAccessPrincipal) { $SqlAccessPrincipal = Get-DefaultSqlAccessPrincipal }
     $sqlScript = Join-Path $SourceRoot 'CreateDatabase.sql'
     if (Test-Path $sqlScript) {
         try {
-            New-ClientHealthDatabase -SqlServer $SqlServer -SqlScriptPath $sqlScript
+            New-ClientHealthDatabase -SqlServer $SqlServer -SqlScriptPath $sqlScript -AccessPrincipal $SqlAccessPrincipal
             Write-Host '  Database created/updated successfully' -ForegroundColor Green
         }
         catch {
@@ -672,7 +768,7 @@ function Start-ClientHealthWizard {
     try { New-FileShare -UncPath $ClientSharePath -Description 'ConfigMgr Client Health - Client Files' }
     catch { Write-Warning "  Client share: $_" }
 
-    try { New-FileShare -UncPath $LogSharePath -Description 'ConfigMgr Client Health - Logs' }
+    try { New-FileShare -UncPath $LogSharePath -Description 'ConfigMgr Client Health - Logs' -ChangeAccess 'Everyone' }
     catch { Write-Warning "  Log share: $_" }
 
     Copy-SourceFiles -SourceRoot $SourceRoot -TargetPath $ClientSharePath -ConfigFile $configFile
@@ -712,6 +808,7 @@ function Start-ClientHealthWizard {
     Write-Host "    - Client share:   $ClientSharePath"
     Write-Host "    - Log share:      $LogSharePath"
     Write-Host "    - SQL database:   ClientHealth on $SqlServer"
+    Write-Host "    - SQL access:     $SqlAccessPrincipal"
     Write-Host "    - CM Package:     ConfigMgr Client Health"
     Write-Host "    - CI:             ConfigMgr Client Health - Compliance"
     Write-Host "    - Baseline:       ConfigMgr Client Health"
@@ -735,7 +832,7 @@ function Start-ClientHealthWizard {
 # Guard: skip execution when dot-sourced for testing
 if ($MyInvocation.InvocationName -ne '.') {
     $wizardParams = @{}
-    foreach ($key in @('SiteCode','SiteServer','Domain','ManagementPoint','SqlServer',
+    foreach ($key in @('SiteCode','SiteServer','Domain','ManagementPoints','MPHttps','SqlServer','SqlAccessPrincipal',
                        'ClientSharePath','LogSharePath','TargetCollection','ClientVersion',
                        'InstallWebservice','WebserviceServer','WebservicePort','SourceRoot','OutputPath')) {
         $val = Get-Variable -Name $key -ValueOnly -ErrorAction SilentlyContinue
