@@ -1,84 +1,72 @@
 # Changelog
 
-## [1.0.3] - 2026-04-30
+## [0.8.4] - 2026-10-01
 
-### Changed
-- **MP-only ccmsetup resolution** -- `Resolve-Client` no longer reads `Client.Share` when sourcing `ccmsetup.exe`. Configure `Client.ManagementPoints` (array of MP FQDNs) and the script picks one at random, downloads from `http(s)://<MP>/CCM_Client/ccmsetup.exe`, retries the next MP on failure, and injects `SMSMP=`/`/mp:` into the install args at runtime so MPs are maintained in one place.
-- **`Client.MPHttps`** -- new boolean controls HTTP vs HTTPS for the ccmsetup download. Defaults to HTTP.
-- **`Client.Share` deprecated** -- still read for back-compat warning, never used as a download source. Setting it now emits a deprecation warning at reinstall.
-- **Setup wizard** -- prompts for comma-separated MP list and HTTPS y/n. Generated `config.json` writes `Client.ManagementPoints` + `Client.MPHttps`, drops `SMSMP=`/`/mp:` from `ClientInstallProperties` (script injects them at runtime). Wizard validates MP inputs (rejects URL-shaped or whitespace-laden values, rejects empty arrays).
-- **Per-site MP overrides** -- `Sites.<ADSiteName>.ManagementPoints` and `Sites.<ADSiteName>.MPHttps` honored via `Get-SiteConfig`, so each AD site picks from its local MPs without bouncing across WAN.
+113 changes since 0.8.3, including 14 new client health checks.
 
-### Added
-- **Multi-MP random pick with iterate-on-failure** -- a single down MP no longer fails the install if a peer is reachable.
-- **Legacy MP fallback** -- when `Client.ManagementPoints` is missing, the script scrapes any `MP=`, `SMSMP=`, or `/mp:` token from `ClientInstallProperties` so existing configs still work pre-migration.
-- **`Test-ConfigValues` validates Management Points** -- rejects URL-shaped or malformed FQDNs in JSON, site overrides, and the legacy fallback path before they can become download URLs or ccmsetup args.
-- **`ClientHealthDateTimeConverter`** -- API JSON converter accepts the client's `yyyy-MM-dd HH:mm:ss` timestamp format. The minimal-API default JSON binder previously rejected client posts with a 400 before SQL ever saw the row.
-- **`ConvertTo-ConfigBoolean`** helper -- handles the PowerShell `[bool]'False' -> $true` trap when reading XML/JSON booleans.
+### Upgrading
+- The IIS webservice is replaced by a new API. The old one won't work with this version.
+- Update the clients and the API together. Older clients can't authenticate to the new API.
+- Run the setup wizard again. It updates the database, package and CI in place.
+- Give the API server's computer account access to the ClientHealth database.
+- Missing `Options` blocks in your config fall back to the defaults in the README.
+- 1.0.0 through 1.0.3 were pulled. This release replaces them.
 
-### Fixed
-- **JSON config cache fallback was unreachable** -- removed the `[ValidateScript({Test-Path})]` attribute on `-Config` so a missing remote config file no longer blocks param binding before the cache lookup runs.
-- **JSON `LocalFiles` was ignored** -- `Get-LocalFilesPath` always read the XML path; now correctly checks `$script:JsonConfig.LocalFiles` first and falls back to the SystemDrive default when blank.
-- **Webservice URL trailing slash** -- `Update-Webservice` now `TrimEnd('/')` before appending the API route, so `-Webservice http://host:5000/` and `-Webservice http://host:5000` both produce a clean `http://host:5000/api/Clients`.
-- **`ccmsetup.exe` could be run from a phantom path** -- old code accepted any directory that existed at `Client.Share` and assumed `ccmsetup.exe` was inside; now verifies the binary is actually present before using it (and the share path is gone entirely from the resolve flow).
-- **SQL migration block** -- `Drivers` column migration was paired with `ALTER COLUMN Build` (re-altering Build twice, never altering Drivers); fixed. DNS / Updates / Services migrations checked `CHARACTER_MAXIMUM_LENGTH = 100` while ALTERing to `200`, making them re-run on every execution; fixed by matching WHERE to the new size. Nullable columns aligned with the original CREATE TABLE schema.
-- **Stripped legacy MP tokens at install time** -- `Resolve-Client` strips `SMSMP=`, `MP=`, and `/mp:` from `ClientInstallProperties` before injecting the picked MP, so legacy configs don't end up sending two different MPs to ccmsetup.
+### Security
+- SQL writes use parameters instead of string-built queries.
+- No more `Invoke-Expression`. Config values are validated, and paths only expand environment variables.
+- Downloaded installers only run with a valid, unrevoked Microsoft signature.
+- Fixed privilege escalation in the local staging and download folders, and cleanup no longer follows links.
+- The API requires Windows authentication by default and checks the SQL server certificate when it can.
+- Only domain computers can write to the log share.
 
-### Removed
-- **Three stranded webservice helpers** -- `Get-ConfigFromWebservice`, `Get-ConfigClientInstallPropertiesFromWebService`, `Get-ConfigServicesFromWebservice`. Defined but never called; targeted routes (`/ConfigurationProfile*`) don't exist on the .NET 10 API surface.
+### New
+- JSON config, per-AD-site overrides, and a cached copy for clients that are offline.
+- Setup wizard for the database, shares, package, CI, baseline and API.
+- A self-hosted API instead of the IIS webservice, plus a Findings column for things a person should look at.
+- Break scripts for testing on a lab client, and an XML to JSON converter.
+- `NotifyOnly=TRUE` on a device turns the script into report-only mode there.
+- New checks: CcmEval task, client activity, Windows Update source and scan errors, TLS and .NET strong crypto, co-management, secure channel, script policy, CMG and PKI certificates, cloned client IDs, Delivery Optimization.
+- Missing MSI caches get rebuilt: the client by a reinstall, Policy Platform from the MP.
+- A missing or broken VC++ runtime gets installed or repaired from the MP.
 
----
+### Client fixes
+- The CI starts the health run as a scheduled task, so the 60 second compliance script timeout no longer kills it.
+- WMI: salvage instead of reset, and a failed query is reported instead of "repaired".
+- A missing client certificate or a broken client WMI namespace now means a reinstall. Key files and the namespace are left alone.
+- registry.pol is only renamed when it's corrupt or WUAHandler logs the documented error, at most once a week. Group Policy errors are reported.
+- BITS service permissions are no longer touched. Only failed jobs older than a week are removed.
+- Provisioning mode is cleared through WMI, and only after the client's own 48 hour window.
+- The cache size from your client settings wins over the config.
+- ccmsetup gets every MP, the HTTPS prefix when you use it, and `/forceinstall` instead of a separate uninstall. Its result comes from ccmsetup.log.
+- The client is reinstalled at most once per run, the script stops waiting on ccmsetup after an hour, and it skips the client WMI check while ccmsetup is running.
+- Admin shares and the task sequence service dependency are reported on servers instead of changed.
+- A low client database file count and CcmSQLCE.log activity are reported, not used as a reason to reinstall.
+- Only state messages that have been stuck for over an hour are resent.
+- Updates install through DISM, so checkpoint updates work.
+- BITS and Windows Update are fine on Manual startup.
+- Windows 11, Server 2022 and Server 2025 are detected, and current Windows builds map to the right update folders.
+- Disabled settings are respected for orphaned cache cleanup, compliance refresh and four other checks.
+- Pending reboot and reboot app checks work with JSON config, and component servicing reboots are detected.
+- SQL writes retry, store zeros as zeros, and send dates independent of the server's language. The last install time is kept when a run doesn't reinstall.
+- Exit code 1 when a client install or the result upload fails.
+- Plenty of smaller fixes: version comparison, missing services, services set to Stopped, DNS registration policy, log size minimum, locale-safe reboot app task, UTF-8 webservice posts, and dead code removed.
 
-## [1.0.2] - 2026-03-30
+### API fixes
+- Records with empty numbers or dates are accepted, and over-long values are shortened instead of rejected.
+- Hostnames that differ only in case or trailing spaces are treated as the same machine.
+- Two first reports from the same machine at the same time no longer fail.
+- The client's time stamp is stored, same as the SQL path. List pages are capped at 1000 records.
 
-### Added
-- **Remediation break scripts** -- 12 scripts in `Tests/BreakScripts/` that intentionally introduce specific health issues on lab endpoints for validation testing. Includes `Break-All.ps1` for full end-to-end testing and `Get-HealthState.ps1` for read-only pre/post comparison. Safety-gated behind `$env:YOURLAB = 'true'`.
-- **README: Remediation Testing section** -- full testing workflow documentation with step-by-step instructions, script reference table, safety notes, and scope limitations.
-
----
-
-## [1.0.1] - 2026-03-30
-
-### Added
-- **Automated setup wizard** -- `Deploy/Install-ClientHealth.ps1` guides through environment setup, generates config.json, creates the ClientHealth SQL database, provisions all MECM objects (Package, Program, CI, Baseline, deployments), and optionally installs the REST API webservice as a Windows Service. Supports interactive and unattended modes.
-- **51 Pester tests** for the setup wizard -- config generation, function contracts, security, compatibility with the main script.
-- **ccmsetup.exe download from MP** -- `Resolve-Client` now downloads a fresh `ccmsetup.exe` from `http://<MP>/CCM_Client/ccmsetup.exe` when `Client.Share` is empty or unreachable, avoiding reliance on potentially corrupt local files.
-
-### Changed
-- **ClientInstallProperties corrected per Microsoft docs** -- replaced undocumented `MP=` with documented `SMSMP=` (client.msi property for initial management point). `/mp:` ccmsetup parameter retained for installation source. Removed `/Source:` (unnecessary) and `/skipprereq:silverlight.exe` (obsolete).
-- **Comprehensive README** -- full configuration reference, all 25 health checks documented, API reference, deployment walkthroughs, troubleshooting guide.
-
-### Fixed
-- **CI creation used nonexistent cmdlets** -- replaced `New-CMComplianceSettingScript` / `Add-CMComplianceSettingScript -Setting -Rule` (don't exist) with single `Add-CMComplianceSettingScript` call using `-ValueRule` parameter set, verified against Microsoft docs.
-- **`Resolve-Client` would `Exit 1` with empty `Client.Share`** -- the original script required a file share with ccmsetup.exe staged. Now gracefully falls back to MP download.
-
----
-
-## [1.0.0] - 2026-03-30 (Community Fork)
-
-### Security (Critical)
-- **SQL injection eliminated** -- `Update-SQL` rewritten with `SqlParameter` objects. `Invoke-Sqlcmd2` extended to accept `-SqlParameters`. All 39 log properties are parameterized.
-- **Command injection eliminated** -- 3 `Invoke-Expression` calls replaced with `Start-Process -ArgumentList` (ccmsetup.exe) and `& operator` (sc.exe). Backtick-semicolon escaping removed.
-- **Config input validation** -- `Test-ConfigValues` validates service names, site codes, and domains against regex patterns before use in WMI filters.
-
-### Added
-- **JSON configuration** -- `config.json` with cleaner structure, native types, and array-based install properties. XML backward compatibility preserved.
-- **Site-aware configuration** -- `Get-SiteConfig` resolves per-site overrides (SQLServer, ClientShare, LogShare) from AD site detection via `Win32_NTDomain`.
-- **Config caching** -- Last-known-good JSON config cached to `%ProgramData%\ConfigMgrClientHealth\`. Falls back to cache when network config unreachable.
-- **Retry logic** -- `Invoke-WithRetry` helper (3 attempts, 5s delay) applied to SQL writes.
-- **Consolidated trigger function** -- `Invoke-CCMTrigger -ScheduleID` replaces 5 separate trigger functions.
-- **77 Pester tests** -- Security, CIM migration, error handling, JSON config, site-aware, caching, SQL schema alignment.
-
-### Changed
-- **Full CIM migration** -- All 55 `Get-WmiObject` replaced with `Get-CimInstance`. All `Invoke-WmiMethod` replaced with `Invoke-CimMethod`. All `[wmiclass]` replaced with `Invoke-CimMethod`. `$PowerShellVersion` branching removed.
-- **Error handling** -- All empty `catch{}` blocks now log via `Write-Verbose` or `Write-Warning`.
-- **`-Config` parameter** accepts both `.xml` and `.json` extensions.
-
-### Removed
-- `$PowerShellVersion` variable and all PS version branching (CIM works on PS 5.1+)
-- `Invoke-Expression` usage (security risk)
-- String-concatenated SQL queries (injection risk)
-- 5 duplicate trigger functions (consolidated into `Invoke-CCMTrigger`)
+### Setup fixes
+- Tables are created in the ClientHealth database, not wherever the connection landed.
+- A rerun updates the CI scripts, DP content and deployments without creating a second baseline deployment.
+- The staging program reruns every time and runs outside maintenance windows.
+- A partly created CI is removed, and deployment failures are reported.
+- The API service is installed with a correct path, and its port and firewall rule are updated on a rerun.
+- Nothing is staged when a package source file is missing, and a staged script owned by a non-admin won't run.
+- A local server given by FQDN is detected, and unattended mode validates every value.
+- The XML converter moves MP settings to the new management point list.
 
 ---
 

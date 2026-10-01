@@ -1,14 +1,14 @@
 # ConfigMgr Client Health (Community Fork)
 
-Automated detection and remediation of common MECM/ConfigMgr client health issues. Validates 25+ health checks, remediates problems automatically, and logs results to SQL Server, file shares, and an optional REST API.
+Finds and fixes the usual ConfigMgr client problems: broken WMI, stuck provisioning mode, a corrupt registry.pol, wrong cache size, missing admin shares, services that won't start, and a long list of others. Results go to a local log, a log share, SQL, or a small REST API.
 
-**This is a maintained community fork** of [AndersRodland/ConfigMgrClientHealth](https://github.com/AndersRodland/ConfigMgrClientHealth) (v0.8.3). The original tool is widely deployed in production MECM environments but was abandoned in 2023 with unpatched security vulnerabilities and deprecated WMI APIs.
+This is a fork of Anders Rodland's [ConfigMgrClientHealth](https://github.com/AndersRodland/ConfigMgrClientHealth). The original stopped at 0.8.3 in 2023. Plenty of shops still run it, but it had some security problems and used the old WMI cmdlets. This fork fixes those and adds checks for things that broke in Windows and ConfigMgr since then.
 
 ---
 
 ## Table of Contents
 
-- [What This Fork Changes](#what-this-fork-changes)
+- [What's Different in This Fork](#whats-different-in-this-fork)
 - [Requirements](#requirements)
 - [Quick Start (Automated Setup)](#quick-start-automated-setup)
 - [Manual Setup](#manual-setup)
@@ -43,29 +43,27 @@ Automated detection and remediation of common MECM/ConfigMgr client health issue
 
 ---
 
-## What This Fork Changes
+## What's Different in This Fork
 
-### Security (Critical)
+### Security
 
-- **SQL injection eliminated** -- `Update-SQL` rewritten with parameterized queries (`SqlParameter` objects). The original built 39-column UPSERT queries via string concatenation.
-- **Command injection eliminated** -- All `Invoke-Expression` calls replaced with `Start-Process -ArgumentList` arrays for ccmsetup.exe and `& operator` for sc.exe.
-- **Config input validation** -- Service names, site codes, and domains validated against regex patterns before use in WMI filters.
+The SQL writes are parameterized now. The original built the whole UPSERT out of string concatenation. `Invoke-Expression` is gone, and config values (service names, site codes, domains, MPs) are validated before they get anywhere near a WMI filter or a command line. Paths in the config expand `%VAR%` and `$env:VAR` and nothing else.
 
-### Modernization
+A downloaded `ccmsetup.exe` (or VC++ redist, or Policy Platform MSI) only runs if it carries a valid, unrevoked Microsoft signature. `%ProgramData%\ConfigMgrClientHealth` is locked to SYSTEM and Administrators, and the CI won't run a staged script that somebody else owns.
 
-- **Full CIM migration** -- All 55 `Get-WmiObject` calls replaced with `Get-CimInstance`. All `Invoke-WmiMethod` replaced with `Invoke-CimMethod`. PowerShell version branching removed (CIM works on PS 5.1+).
-- **JSON configuration** -- New `config.json` format alongside backward-compatible XML support. Cleaner structure, native boolean/integer types, array-based install properties.
-- **Site-aware configuration** -- Per-site overrides for SQL Server, client share, and log share via AD site detection. Supports 300+ site deployments without hardcoded server names.
-- **Config caching** -- Caches last-known-good config locally. VPN/ZPA clients continue operating when the network config path is unreachable.
-- **Automated setup wizard** -- `Install-ClientHealth.ps1` guides you through environment setup, generates config, creates the database, provisions MECM objects, and optionally installs the API webservice.
-- **REST API webservice** -- Modern ASP.NET Core minimal API replaces the original IIS-hosted webservice. Runs as a Windows Service, no IIS required.
-- **MP-only client reinstall** -- `ccmsetup.exe` is always downloaded fresh from a configured Management Point at reinstall time. No `Client.Share` lookup, no relying on potentially stale on-disk copies. Multi-MP environments configure an array of MPs; the script shuffles, tries each in turn, and falls through on failure so a single down MP does not sink the install.
+The API uses Windows authentication by default, and a computer can only write its own record.
 
-### Reliability
+### Everything else
 
-- **Retry logic** -- SQL writes use `Invoke-WithRetry` (3 attempts, 5-second delay) for transient failures.
-- **No silent failures** -- All empty `catch{}` blocks replaced with `Write-Verbose` or `Write-Warning` logging.
-- **Consolidated trigger functions** -- 5 separate schedule trigger functions merged into single `Invoke-CCMTrigger`.
+- CIM instead of `Get-WmiObject` throughout.
+- JSON config. XML still works, and `Convert-ConfigXmlToJson.ps1` converts it.
+- Per-AD-site overrides for the SQL server, log share and management points, so one config covers every site.
+- The last good config is cached locally, so clients on VPN keep working when the share is unreachable.
+- `Install-ClientHealth.ps1` sets up the database, shares, package, CI, baseline and API in one go.
+- The IIS webservice is replaced by a small ASP.NET Core API that runs as a Windows service.
+- Client reinstalls download `ccmsetup.exe` straight from your management points and try the next one if one is down. No client share needed.
+- New report-only checks write to a Findings column, so you can see problems the script shouldn't fix on its own.
+- Set `NotifyOnly=TRUE` on a device and the script reports everything and changes nothing there.
 
 ---
 
@@ -74,7 +72,7 @@ Automated detection and remediation of common MECM/ConfigMgr client health issue
 | Component | Version | Purpose |
 |-----------|---------|---------|
 | PowerShell | 5.1+ (Windows PowerShell) | Script runtime |
-| Windows | 10 / Server 2016+ | Target OS |
+| Windows | 10, 11 / Server 2016-2025 | Target OS |
 | ConfigMgr Client | Any supported version | Managed endpoint |
 | SQL Server | 2016+ | Database logging (optional) |
 | .NET | 10.0+ | API webservice only (optional) |
@@ -85,7 +83,7 @@ Automated detection and remediation of common MECM/ConfigMgr client health issue
 
 ## Quick Start (Automated Setup)
 
-The setup wizard handles everything: config generation, database creation, file shares, and MECM object provisioning.
+Run the setup wizard from a machine with the ConfigMgr console. It writes the config, creates the database and shares, and builds the ConfigMgr objects.
 
 ```powershell
 .\Deploy\Install-ClientHealth.ps1
@@ -107,25 +105,23 @@ The wizard prompts for:
 | CM client version | X.XX.XXXX.XXXX format | `5.00.9128.1007` |
 | Install webservice? | y/n | `n` |
 
-After confirmation, the wizard performs every step end-to-end:
+Once you confirm, it:
 
-1. Generates `config.json` with all values populated
-2. Executes `CreateDatabase.sql` against your SQL Server and grants permissions
-3. Creates or validates file shares (client share + log share)
-4. Copies script + config to the client share
-5. Creates the CM Package with a Program that stages files to `%ProgramData%\ConfigMgrClientHealth\`
-6. Distributes content to all DP groups
-7. Creates a Configuration Item with detection and remediation scripts embedded
-8. Creates a Configuration Baseline, adds the CI, and deploys it to your target collection
-9. Deploys the Package to your target collection on a weekly schedule
+1. Writes `config.json`.
+2. Runs `CreateDatabase.sql` and grants access.
+3. Creates the client share and the log share. Only `DOMAIN\Domain Computers` can write to the log share.
+4. Copies the script and config to the client share.
+5. Creates the package and a program that stages the files to `%ProgramData%\ConfigMgrClientHealth\`. If the package already exists, it updates the content on the DPs.
+6. Distributes the content to all DP groups.
+7. Creates the configuration item with the detection and remediation scripts. On a rerun it updates the scripts in the existing CI.
+8. Creates the baseline and deploys it to your target collection.
+9. Deploys the package to the same collection weekly. The program reruns every time, so config changes reach the clients.
 
-If you answered **yes** to the webservice prompt, the wizard also:
+If you said yes to the webservice, it also publishes the API with `dotnet publish`. On a local server it installs it under `C:\Program Files\ClientHealthApi\` as a service, opens the port for the Domain firewall profile and starts it. For a remote server it gives you the files and the commands to run there.
 
-10. Runs `dotnet publish` to build a self-contained executable
-11. If the target server is local: copies files to `C:\Program Files\ClientHealthApi\`, installs as a Windows Service via `sc.exe create`, starts the service
-12. If the target server is remote: outputs the published files and provides the exact `sc.exe` command to run on the target
+You can run the wizard again after an upgrade. It updates what's already there instead of creating duplicates.
 
-**There are zero manual steps after the wizard completes.** Everything -- Package, Program, CI, Baseline, deployments, database, shares, and optionally the webservice -- is provisioned automatically.
+If you use the API, you still have to give the API server's computer account access to the database yourself.
 
 For unattended/scripted setup:
 
@@ -167,7 +163,7 @@ ALTER ROLE db_datawriter ADD MEMBER [DOMAIN\Domain Computers]
 
 The database contains two tables:
 - **Configuration** -- Tracks schema version (currently `0.7.5`)
-- **Clients** -- One row per managed device (39 columns, `Hostname` as primary key)
+- **Clients** -- One row per managed device (40 columns, `Hostname` as primary key)
 
 ### 2. Configure
 
@@ -227,14 +223,14 @@ The script accepts two parameters:
 
 | JSON Path | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `LocalFiles` | string | `C:\ClientHealth` | Local temp directory for temporary files and local log |
+| `LocalFiles` | string | `C:\ClientHealth` | Folder for the local log and temporary files. The wizard sets `C:\ProgramData\ConfigMgrClientHealth`, which the script keeps locked to SYSTEM and Administrators. Use that path. |
 | `Client.Version` | string | -- | Minimum required ConfigMgr agent version (e.g., `5.00.9128.1007`) |
 | `Client.SiteCode` | string | -- | Expected 3-character MECM site code |
 | `Client.Domain` | string | -- | Expected Active Directory domain |
 | `Client.AutoUpgrade` | bool | `true` | Automatically upgrade agent if below minimum version |
-| `Client.ManagementPoints` | string[] | -- | Management point FQDNs used to download `ccmsetup.exe`. The script shuffles the list, tries each MP until download succeeds, then injects that MP into the install arguments at runtime. |
+| `Client.ManagementPoints` | string[] | -- | Management point FQDNs used to download `ccmsetup.exe`. The script shuffles the list and downloads from the first MP that answers. All of them go on the ccmsetup command line. |
 | `Client.MPHttps` | bool | `false` | Download `ccmsetup.exe` from MPs over HTTPS instead of HTTP. |
-| `Client.Cache.Size` | int | `16384` | Client cache size in MB. Supports percentage strings (e.g., `"5%"`) |
+| `Client.Cache.Size` | int | `16384` | Client cache size in MB, or a percentage string such as `"5%"`. If a client setting configures the cache size, that wins and the script only reports the difference. |
 | `Client.Cache.DeleteOrphanedData` | bool | `true` | Remove orphaned cache packages not tracked by CM |
 | `Client.Cache.Enable` | bool | `true` | Enable cache size validation |
 | `Client.Log.MaxSize` | int | `4096` | Maximum CCM log file size in KB |
@@ -253,7 +249,7 @@ Array of strings passed to `ccmsetup.exe` when installing or reinstalling the cl
 ]
 ```
 
-Do not maintain `SMSMP=`, `MP=`, or `/mp:` here for new JSON configs. Put MPs in `Client.ManagementPoints`; at install time the script picks a reachable MP, strips any stale MP tokens from this array, and injects both `SMSMP=<selectedMp>` and `/mp:<selectedMp>` into the `ccmsetup.exe` command line. Legacy configs that still contain `SMSMP=`, `MP=`, or `/mp:` are read as a fallback when `Client.ManagementPoints` is missing.
+Don't put `SMSMP=`, `MP=`, or `/mp:` here in a JSON config. List your MPs in `Client.ManagementPoints` instead. At install time the script strips any MP entries from this array and builds them itself: `/mp:` with every MP (the one it downloaded from first), `SMSMP=` with that MP, and `SMSMPLIST=` when you have more than one. Legacy configs that still contain `SMSMP=`, `MP=`, or `/mp:` are read as a fallback when `Client.ManagementPoints` is missing.
 
 There are two kinds of entries in this array:
 
@@ -280,9 +276,9 @@ There are two kinds of entries in this array:
 | `CCMHTTPSPORT=443` | HTTPS port for client-to-site communication |
 | `RESETKEYINFORMATION=TRUE` | Remove stale trusted root key (useful when moving between hierarchies) |
 
-> **Note:** `/Source:` is not needed. When reinstalling, the script downloads a fresh `ccmsetup.exe` directly from the selected MP via `http://<MP>/CCM_Client/ccmsetup.exe` or `https://<MP>/CCM_Client/ccmsetup.exe`. This avoids relying on potentially corrupt local files -- the whole reason this script exists.
+You don't need `/Source:`. A reinstall downloads `ccmsetup.exe` from `http(s)://<MP>/CCM_Client/ccmsetup.exe`, so it never depends on files already on the client.
 
-> **Important:** `/mp:` and `SMSMP=` serve different purposes, but you should not hard-code either one in JSON configs. `/mp:` tells `ccmsetup.exe` where to download installation files from; `SMSMP=` sets the initial management point the client uses after installation. The script injects both values from the selected `Client.ManagementPoints` entry.
+`/mp:` and `SMSMP=` do different jobs. `/mp:` is where ccmsetup downloads the install files from. `SMSMP=` is the first MP the installed client talks to. The script sets both, so leave them out of the config.
 
 ### Logging
 
@@ -291,7 +287,7 @@ There are two kinds of entries in this array:
 | `Logging.Share` | string | -- | UNC path for centralized log files (one file per client) |
 | `Logging.Level` | string | `Full` | `Full` logs everything; `ClientInstall` logs only install failures |
 | `Logging.MaxHistory` | int | `8` | Max health check entries per log file before rotation |
-| `Logging.LocalLogFile` | bool | `true` | Keep a local copy of the log at `%ProgramData%\ConfigMgrClientHealth\` |
+| `Logging.LocalLogFile` | bool | `true` | Keep a local log at `<LocalFiles>\ClientHealth.log` |
 | `Logging.FileEnabled` | bool | `true` | Enable network share logging |
 | `Logging.TimeFormat` | string | `ClientLocal` | Timestamp format: `ClientLocal` or `UTC` |
 | `Logging.SQL.Server` | string | -- | SQL Server instance for database logging |
@@ -303,33 +299,59 @@ Log files are written in CMTrace-compatible format, viewable in the CMTrace log 
 
 | JSON Path | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `Options.CcmSQLCELog` | bool | `false` | Check for corruption in the client's local SQLCE database (CcmSQLCE.log) |
-| `Options.BITSCheck.Enable` | bool | `true` | Validate BITS service and jobs |
-| `Options.BITSCheck.Fix` | bool | `true` | Remove error jobs and reset BITS DACL |
+| `Options.CcmSQLCELog` | bool | `false` | Warn when CcmSQLCE.log is active outside debug logging. Report only: current clients write this log during normal operation, so the script never reinstalls the client from this check. |
+| `Options.BITSCheck.Enable` | bool | `true` | Find BITS jobs in the final `Error` state |
+| `Options.BITSCheck.Fix` | bool | `true` | Remove jobs in `Error` state for longer than `Days`. The BITS service permissions are never changed. |
+| `Options.BITSCheck.Days` | int | `7` | Minimum age of an `Error` job before it is removed |
 | `Options.ClientSettingsCheck.Enable` | bool | `true` | Detect task-sequence orphaned client settings policies |
 | `Options.ClientSettingsCheck.Fix` | bool | `true` | Remove orphaned policies |
 | `Options.DNSCheck.Enable` | bool | `true` | Validate DNS records match local IP |
-| `Options.DNSCheck.Fix` | bool | `true` | Re-register with DNS server |
+| `Options.DNSCheck.Fix` | bool | `true` | Re-register with DNS server. Skipped, and reported, when policy or every adapter turns dynamic DNS update off. |
 | `Options.Drivers` | bool | `true` | Report faulty/unknown PnP devices (no auto-fix) |
 | `Options.PatchLevel` | bool | `true` | Report Windows Update Build Revision (UBR) |
 | `Options.Updates.Enable` | bool | `false` | Check for and install missing OS patches from a share |
-| `Options.Updates.Fix` | bool | `true` | Install missing patches |
+| `Options.Updates.Fix` | bool | `true` | Install missing patches with DISM (`Add-WindowsPackage`). All `.msu` files of the share folder are staged together, so checkpoint updates are found. |
 | `Options.Updates.Share` | string | `""` | UNC path to patch repository |
 | `Options.PendingReboot.Enable` | bool | `true` | Detect pending reboots from CBS, WU, and SCCM |
 | `Options.PendingReboot.StartRebootApplication` | bool | `false` | Launch reboot notification app when pending |
 | `Options.RebootApplication.Enable` | bool | `false` | Enable custom reboot notification application |
 | `Options.RebootApplication.Application` | string | `""` | Path to reboot notification executable |
-| `Options.MaxRebootDays` | int | `7` | Force reboot if system uptime exceeds this many days |
+| `Options.MaxRebootDays` | int | `7` | Start the reboot application when uptime is longer than this many days. Only when `RebootApplication.Enable` is true. |
 | `Options.OSDiskFreeSpace` | int | `10` | Warn if OS disk free space drops below this percentage |
 | `Options.HardwareInventory.Enable` | bool | `true` | Check if hardware inventory has run recently |
 | `Options.HardwareInventory.Fix` | bool | `true` | Trigger inventory scan if stale |
 | `Options.HardwareInventory.Days` | int | `10` | Maximum days since last inventory before remediation |
 | `Options.SoftwareMetering.Enable` | bool | `true` | Check software metering prep driver |
-| `Options.SoftwareMetering.Fix` | bool | `true` | Restart CCMExec to fix metering |
-| `Options.WMI.Enable` | bool | `true` | Validate WMI repository integrity |
-| `Options.WMI.Fix` | bool | `true` | Rebuild WMI repository if corrupt |
+| `Options.SoftwareMetering.Fix` | bool | `true` | Reinstall the prep driver and restart CCMExec. Only log lines since the last run count. |
+| `Options.WMI.Enable` | bool | `true` | Validate WMI repository integrity (`winmgmt /verifyrepository` exit code 1358). A failed query is reported only. |
+| `Options.WMI.Fix` | bool | `true` | Back up, then salvage the repository and reinstall the client. The repository is never reset. |
 | `Options.RefreshComplianceState.Enable` | bool | `true` | Periodically refresh compliance state |
 | `Options.RefreshComplianceState.Days` | int | `30` | Days between forced compliance refreshes |
+
+### Extended Checks
+
+Each check has its own `Options.<Name>` block. A missing block uses the default shown. Report-only results go to the `Findings` column (SQL and API) and to the logs.
+
+| JSON Path | Default | What it checks | Fix (when `Fix` is true) |
+|-----------|---------|----------------|--------------------------|
+| `Options.CcmEvalTask` | Enable `true`, Fix `true` | The built-in client health task is missing, disabled, not run for 3 days, or failed | Enable the task. A missing task is reported. |
+| `Options.ClientActivity` | Enable `true`, Fix `true`, Days `7` | No heartbeat (DDR) record, or no heartbeat or policy activity within `Days` | Trigger machine policy and discovery |
+| `Options.WindowsUpdateSource` | Enable `true`, Fix `true` | WSUS-managed clients only (skipped when Intune owns the Windows Update workload): scan-source and dual-scan conflicts, leftover deferral policies, scan source hotfix KB36495448 not applied | Remove `UseUpdateClassPolicySource` from the wrong registry path (written by ConfigMgr 2409/2503 RTM). Everything else is reported. |
+| `Options.WindowsUpdateScan` | Enable `true`, Fix `false`, ResetDays `30` | Scan errors in WUAHandler.log since the last run, by class (corrupt components, proxy, timeout, certificate); domain policy overriding the WSUS server | For corrupt components only: rename `SoftwareDistribution` (at most once per `ResetDays`). This clears the Windows Update history. |
+| `Options.TlsConfiguration` | Enable `true`, Fix `false` | .NET strong crypto, TLS 1.2 client in SChannel, FIPS mode, .NET older than 4.8 | Set `SchUseStrongCrypto` and `SystemDefaultTlsVersions` (restart required). SChannel and FIPS are reported. |
+| `Options.CoManagement` | Enable `true` | Intune Windows Update policy left on a ConfigMgr-managed device; MDM enrollment failures | Report only |
+| `Options.SecureChannel` | Enable `true` | Broken domain secure channel | Report only |
+| `Options.ScriptPolicy` | Enable `true` | Group Policy execution policy AllSigned/Restricted; PowerShell not in Full Language mode | Report only |
+| `Options.SiteCommunication` | Enable `true` | CMG and certificate errors in LocationServices.log and CcmMessaging.log since the last run | Report only |
+| `Options.PkiCertificate` | Enable `false`, Days `30` | No valid PKI client authentication certificate, or one that expires within `Days` (PKI/HTTPS sites) | Report only |
+| `Options.ClientIdentity` | Enable `true` | Cloned client: SMSCFG.ini and WMI client IDs differ, or client certificates older than the OS install | Report only |
+| `Options.DeliveryOptimization` | Enable `true` | Delivery Optimization service disabled or in bypass mode | Report only |
+| `Options.InstallerCache` | Enable `true`, Fix `true` | Missing cached MSI in `%windir%\Installer` for the ConfigMgr client, Microsoft Policy Platform, and the Visual C++ runtimes. A missing cache makes upgrades and repairs fail with 1612. | Client: reinstall with `/forceinstall`. Policy Platform: recache from the management point when the MSI versions match. Visual C++: repaired by `VCRuntime`. |
+| `Options.VCRuntime` | Enable `true`, Fix `true` | Visual C++ 2015-2022 runtime missing, older than 14.28.29914, runtime DLL missing, or cached installer missing | Install or repair from the management point (`CCM_Client\x64` / `i386`) when its version is not older than the installed one |
+
+All downloads from the management point must have a valid Microsoft Authenticode signature.
+
+**Device opt-out:** when `HKLM\Software\Microsoft\CCM\CcmEval\NotifyOnly` is `TRUE`, the script runs every check in monitor mode and changes nothing on the device.
 
 ### Service Monitoring
 
@@ -337,9 +359,9 @@ The `Services` array defines Windows services to monitor. Each entry specifies t
 
 ```json
 "Services": [
-    { "Name": "BITS",         "StartupType": "Automatic (Delayed Start)", "State": "Running", "Uptime": "" },
+    { "Name": "BITS",         "StartupType": "Manual|Automatic|Automatic (Delayed Start)", "State": "", "Uptime": "" },
     { "Name": "winmgmt",      "StartupType": "Automatic",                 "State": "Running", "Uptime": "" },
-    { "Name": "wuauserv",     "StartupType": "Automatic (Delayed Start)", "State": "Running", "Uptime": "" },
+    { "Name": "wuauserv",     "StartupType": "Manual|Automatic|Automatic (Delayed Start)", "State": "", "Uptime": "" },
     { "Name": "lanmanserver", "StartupType": "Automatic",                 "State": "Running", "Uptime": "" },
     { "Name": "RpcSs",        "StartupType": "Automatic",                 "State": "Running", "Uptime": "" },
     { "Name": "W32Time",      "StartupType": "Automatic",                 "State": "Running", "Uptime": "" },
@@ -350,22 +372,22 @@ The `Services` array defines Windows services to monitor. Each entry specifies t
 | Property | Values | Description |
 |----------|--------|-------------|
 | `Name` | Service short name | Must be alphanumeric with hyphens, underscores, or dots |
-| `StartupType` | `Automatic`, `Automatic (Delayed Start)`, `Automatic (Trigger Start)`, `Manual`, `Disabled` | Desired startup type |
-| `State` | `Running`, `Stopped` | Desired service state |
+| `StartupType` | `Automatic`, `Automatic (Delayed Start)`, `Automatic (Trigger Start)`, `Manual`, `Disabled`. Separate accepted values with `\|`. | Accepted startup types. When the current type is not in the list, the first one is set. |
+| `State` | `Running`, `Stopped`, or empty | Desired service state. Empty leaves the state unchanged. |
 | `Uptime` | Empty string or integer | If set to a number of days, the service is restarted when uptime exceeds that value |
 
-You can add any Windows service to this list. The script will set the startup type and start/stop the service as configured.
+You can add any Windows service to this list. The script will set the startup type and start/stop the service as configured. A listed service that does not exist is reported as `Missing: <name>`. BITS and wuauserv accept Manual: Windows starts them on demand, and the ConfigMgr client health check accepts Manual or Automatic for both.
 
 ### Remediation
 
 | JSON Path | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `Remediation.AdminShare` | bool | `true` | Re-enable ADMIN$ and C$ shares if disabled |
-| `Remediation.ClientProvisioningMode` | bool | `true` | Exit provisioning mode if stuck |
-| `Remediation.ClientStateMessages` | bool | `true` | Re-send state messages if forwarding fails |
-| `Remediation.ClientWUAHandler.Fix` | bool | `true` | Fix WUA handler registry.pol issues |
-| `Remediation.ClientWUAHandler.Days` | int | `30` | Age threshold (days) for stale registry.pol |
-| `Remediation.ClientCertificate` | bool | `true` | Remove stale certificates causing registration failures |
+| `Remediation.AdminShare` | bool | `true` | Restart the Server service when ADMIN$ or C$ is missing, on client OS only. Servers and shares disabled by `AutoShareWks`/`AutoShareServer` are reported. |
+| `Remediation.ClientProvisioningMode` | bool | `true` | Leave provisioning mode through `SMS_Client.SetClientProvisioningMode`, after the client's own 48-hour window |
+| `Remediation.ClientStateMessages` | bool | `true` | Send state messages that are unsent for more than 1 hour |
+| `Remediation.ClientWUAHandler.Fix` | bool | `true` | When registry.pol has no valid `PReg` header, or WUAHandler.log reports "overwritten by a higher authority" with 0x87d00692, rename registry.pol, run `gpupdate`, restart CCMExec, and start the update scan and deployment cycles. The log trigger is skipped when a domain controller is the source. |
+| `Remediation.ClientWUAHandler.Days` | int | `7` | Minimum days between two registry.pol repairs |
+| `Remediation.ClientCertificate` | bool | `true` | Reinstall the client (`/forceinstall`) when ClientIDManagerStartup.log reports a missing certificate since the last run |
 
 ### Site-Aware Configuration
 
@@ -390,49 +412,44 @@ For multi-site deployments, the `Sites` section provides per-site overrides. The
 }
 ```
 
-Supported override properties: `SQLServer`, `ManagementPoints`, `MPHttps`, `LogShare`. Per-site `ManagementPoints` is the typical use -- each AD site gets its local MPs and the random-pick stays local instead of bouncing across WAN links.
+You can override `SQLServer`, `ManagementPoints`, `MPHttps` and `LogShare`. Most people use it for `ManagementPoints`, so each site reinstalls from its local MPs instead of going across the WAN.
 
 ---
 
 ## Health Checks
 
-The script runs these checks in sequence. Each check logs its result and remediates if the corresponding config option is enabled.
+The checks run in this order. Each one logs its result and fixes the problem if its config option allows it.
 
 | # | Check | What It Detects | Remediation | Config |
 |---|-------|-----------------|-------------|--------|
-| 1 | **WMI Repository** | Corrupt WMI (`winmgmt /verifyrepository`) | Re-registers WMI binaries, rebuilds repository | `Options.WMI` |
+| 1 | **WMI Repository** | Inconsistent repository (`winmgmt /verifyrepository` exit code 1358) | Back up, salvage, reinstall the client. Never resets the repository. | `Options.WMI` |
 | 2 | **Compliance State** | Stale compliance evaluation | Triggers `RefreshServerComplianceState()` | `Options.RefreshComplianceState` |
-| 3 | **CM Client Installed** | Client not installed, missing DB files, corrupt SQLCE, service won't start | Picks an MP from `Client.ManagementPoints` (random, retries the next on failure), downloads a fresh `ccmsetup.exe` from that MP, reinstalls with configured properties + injected `SMSMP=`/`/mp:` | `Client.ManagementPoints`, `Client.MPHttps`, `Client.Version`, `Client.AutoUpgrade` |
+| 3 | **CM Client Installed** | Client not installed, `SMS_Client` unreachable, service won't start | Picks an MP from `Client.ManagementPoints` (random, retries the next on failure), downloads a signed `ccmsetup.exe`, reinstalls with `/mp:` listing all MPs, `SMSMP=`, `SMSMPLIST=`, and `/forceinstall` when the client must be removed first. Reads the result from ccmsetup.log. | `Client.ManagementPoints`, `Client.MPHttps`, `Client.Version`, `Client.AutoUpgrade` |
 | 4 | **Client Version** | Agent below minimum version | Upgrade via ccmsetup.exe | `Client.Version`, `Client.AutoUpgrade` |
 | 5 | **Services** | Wrong startup type, not running, uptime exceeded | Set startup type, start/stop service | `Services` array |
 | 6 | **Site Code** | Assigned to wrong site | Reassign via `SMS_Client.SetAssignedSite()` | `Client.SiteCode` |
-| 7 | **Cache Size** | Cache too small or too large | Set via COM object (supports MB or percentage) | `Client.Cache` |
+| 7 | **Cache Size** | Cache too small or too large | Set via COM object (supports MB or percentage). Report only when a client setting configures the cache size. | `Client.Cache` |
 | 8 | **Log Size** | CCM log files too small/large | Update registry `HKLM:\SOFTWARE\Microsoft\CCM\Logging\@GLOBAL` | `Client.Log` |
-| 9 | **Provisioning Mode** | Client stuck in provisioning mode | Disable via registry + CIM method | `Remediation.ClientProvisioningMode` |
-| 10 | **Client Certificate** | Stale certificate blocking registration | Remove certificate file, trigger re-enrollment | `Remediation.ClientCertificate` |
+| 9 | **Provisioning Mode** | Client in provisioning mode beyond its 48-hour window | `SMS_Client.SetClientProvisioningMode` | `Remediation.ClientProvisioningMode` |
+| 10 | **Client Certificate** | Missing client certificate or rejected registration since the last run | Client reinstall for a missing certificate; a rejected registration is reported | `Remediation.ClientCertificate` |
 | 11 | **Hardware Inventory** | Inventory not run in configured days | Trigger schedule `{00000000-0000-0000-0000-000000000001}` | `Options.HardwareInventory` |
-| 12 | **Software Metering** | PrepDriver errors | Restart CCMExec service | `Options.SoftwareMetering` |
+| 12 | **Software Metering** | PrepDriver errors since the last run | Reinstall prepdrv.inf, restart CCMExec | `Options.SoftwareMetering` |
 | 13 | **DNS** | FQDN mismatch, DNS IPs not in local config | Re-register DNS (`ipconfig /registerdns`) | `Options.DNSCheck` |
-| 14 | **BITS** | Error/TransientError jobs | Remove bad jobs, reset BITS DACL | `Options.BITSCheck` |
+| 14 | **BITS** | Jobs in `Error` state older than `Days` | Remove those jobs | `Options.BITSCheck` |
 | 15 | **Client Settings** | Orphaned task-sequence policies | Remove `CCM_ClientAgentConfig` where `PolicySource = "CcmTaskSequence"` | `Options.ClientSettingsCheck` |
-| 16 | **WUA Handler** | registry.pol corruption, GP errors | Delete stale registry.pol, run `gpupdate` | `Remediation.ClientWUAHandler` |
-| 17 | **State Messages** | Failed MP forwarding | Refresh server compliance state | `Remediation.ClientStateMessages` |
-| 18 | **Admin Shares** | ADMIN$ / C$ missing | Restart Server service (`lanmanserver`) | `Remediation.AdminShare` |
-| 19 | **Missing Drivers** | Faulty PnP devices (error code != 0, 22) | Report only -- no auto-fix | `Options.Drivers` |
-| 20 | **OS Updates** | Missing patches (from share) | Install from configured update share | `Options.Updates` |
-| 21 | **Disk Space** | OS drive below threshold | Report only -- no auto-fix | `Options.OSDiskFreeSpace` |
-| 22 | **Pending Reboot** | CBS, Windows Update, SCCM SDK | Launch reboot app or force reboot if uptime > max days | `Options.PendingReboot`, `Options.MaxRebootDays` |
+| 16 | **WUA Handler** | registry.pol without a valid `PReg` header; "Overwritten by a higher authority" with 0x87d00692 since the last run; Group Policy errors (reported) | Rename registry.pol, `gpupdate`, restart CCMExec, scan and deployment cycles | `Remediation.ClientWUAHandler` |
+| 17 | **State Messages** | State messages unsent for more than 1 hour | Send unsent state messages (schedule 111) | `Remediation.ClientStateMessages` |
+| 18 | **Admin Shares** | ADMIN$ / C$ missing | Restart Server service on client OS; report on servers | `Remediation.AdminShare` |
+| 19 | **Missing Drivers** | Faulty PnP devices (error code != 0, 22) | Report only | `Options.Drivers` |
+| 20 | **OS Updates** | Missing patches (from share) | Install with DISM from configured update share | `Options.Updates` |
+| 21 | **Disk Space** | OS drive below threshold | Report only | `Options.OSDiskFreeSpace` |
+| 22 | **Pending Reboot** | CBS, Windows Update, SCCM SDK | Start the reboot application when a reboot is pending or uptime is longer than `MaxRebootDays`. Never reboots on its own. | `Options.PendingReboot`, `Options.MaxRebootDays` |
 | 23 | **Orphaned Cache** | Cache folders not tracked by CM | Delete orphaned folders | `Client.Cache.DeleteOrphanedData` |
 | 24 | **CCMSETUP AppData** | SYSTEM profile AppData path incorrect | Fix registry value | Always runs |
-| 25 | **SMSTSMgr Dependency** | SMSTSMgr not dependent on CCMExec | Set service dependency | Always runs |
+| 25 | **SMSTSMgr Dependency** | SMSTSMgr depends on CCMExec | Report only (changing ConfigMgr service configuration is not supported) | Always runs |
+| 26 | **Extended checks** | See [Extended Checks](#extended-checks) | Per check | `Options.<Name>` |
 
-After all checks complete, the script:
-- Triggers machine policy evaluation
-- Triggers state message resend
-- Triggers update scan
-- Restarts CCMExec if any check flagged it
-- Runs CCMEval
-- Writes `LastRun` timestamp to `HKLM:\Software\ConfigMgrClientHealth`
+At the end it resends state messages, starts the update source and scan cycles and machine policy evaluation, and restarts CCMExec if a check asked for it. Then it writes `LastRun` to `HKLM:\Software\ConfigMgrClientHealth`. The exit code is 1 if a client install or the result upload failed, otherwise 0.
 
 ---
 
@@ -440,9 +457,9 @@ After all checks complete, the script:
 
 ### Option A: Configuration Baseline (Recommended)
 
-This is the preferred approach. The script and config are cached locally, so clients work even when disconnected from the network.
+Use this one if you can. The script and config live on the client, so it still runs when the client is off the network.
 
-The setup wizard (`Install-ClientHealth.ps1`) creates all of these objects automatically. For manual setup:
+The setup wizard creates all of this for you. To do it by hand:
 
 **Step 1: Create a CM Package**
 
@@ -455,7 +472,7 @@ Create a Program:
 ```
 powershell.exe -ExecutionPolicy Bypass -File Deploy-ClientHealthPackage.ps1
 ```
-This copies the script and config to `%ProgramData%\ConfigMgrClientHealth\` on each client.
+This copies the script and config to `%ProgramData%\ConfigMgrClientHealth\` on each client. The program restricts that folder to SYSTEM and Administrators, and exits with code 1 if a file does not copy.
 
 **Step 2: Create a Configuration Item**
 
@@ -471,26 +488,7 @@ try {
 catch { return $false }
 ```
 
-Remediation script (`CI-Remediation.ps1`) -- invokes the locally cached copy:
-```powershell
-$ScriptDir = Join-Path $env:ProgramData 'ConfigMgrClientHealth'
-$ScriptPath = Join-Path $ScriptDir 'ConfigMgrClientHealth.ps1'
-$ConfigPath = Join-Path $ScriptDir 'config.json'
-
-if (-not (Test-Path $ScriptPath)) {
-    Write-Error "ConfigMgrClientHealth.ps1 not found at $ScriptPath. Deploy the package first."
-    exit 1
-}
-if (-not (Test-Path $ConfigPath)) {
-    Write-Error "config.json not found at $ConfigPath. Deploy the package first."
-    exit 1
-}
-try { & $ScriptPath -Config $ConfigPath }
-catch {
-    Write-Error "ConfigMgr Client Health failed: $_"
-    exit 1
-}
-```
+Remediation script: use the full content of `Deploy/CI-Remediation.ps1`. It checks that SYSTEM or Administrators own the folder, the script, and the config; if they do not, it exits with code 1 and runs nothing. It then starts the health check in the scheduled task `ConfigMgr Client Health` (SYSTEM, 2-hour limit) and returns at once. The client stops a compliance script after the client setting **Script execution timeout** (60 seconds by default, 600 at most), and a health run or a client reinstall takes longer. Detection reports compliant after the task updates `LastRun`. The setup wizard updates these scripts in an existing configuration item.
 
 CI settings:
 - Data type: Boolean
@@ -519,18 +517,18 @@ Create a scheduled task that runs weekly as SYSTEM:
 powershell.exe -ExecutionPolicy Bypass -File "\\server\ClientHealth$\ConfigMgrClientHealth.ps1" -Config "\\server\ClientHealth$\config.json"
 ```
 
-> **Note:** Options B and C require network access to the script/config share at runtime. Option A caches locally and works offline via config caching.
+B and C need the share to be reachable when the script runs. A doesn't.
 
 ---
 
 ## Logging and Reporting
 
-The script supports four independent logging destinations. Enable any combination.
+There are four places results can go. Turn on whichever ones you want.
 
 ### Local File Logging
 
 - **Config:** `Logging.LocalLogFile = true`
-- **Location:** `%ProgramData%\ConfigMgrClientHealth\ClientHealth.log`
+- **Location:** `<LocalFiles>\ClientHealth.log` (`C:\ProgramData\ConfigMgrClientHealth\ClientHealth.log` with a wizard config)
 - **Format:** CMTrace-compatible (open with CMTrace or OneTrace)
 - **Severity levels:** 1 = Information, 2 = Warning, 3 = Error
 
@@ -553,25 +551,28 @@ The script supports four independent logging destinations. Enable any combinatio
 
 - **Config:** Pass `-Webservice http://server:5000` at runtime
 - **Endpoint:** `POST /api/Clients`
-- **Format:** JSON, automatic timestamp
-- **Advantage:** No direct SQL access required from clients
+- **Format:** JSON (UTF-8)
+- **Authentication:** The client sends the computer account credentials (`-UseDefaultCredentials`)
+- Clients don't need access to SQL.
 
 ---
 
 ## API Reference
 
-The optional REST API webservice provides centralized health data access. Built with ASP.NET Core minimal APIs, it runs as a Windows Service (no IIS required).
+The API is optional. It's a small ASP.NET Core app that runs as a Windows service, no IIS.
 
 ### Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/` | Health check -- returns `{ Status, Version, Timestamp }` |
-| `GET` | `/api/Clients` | List all clients (paginated: `?skip=0&take=50`) |
-| `GET` | `/api/Clients/{hostname}` | Get a specific client record |
-| `POST` | `/api/Clients` | Create or update a client (UPSERT) |
-| `PUT` | `/api/Clients/{hostname}` | Update an existing client |
-| `DELETE` | `/api/Clients/{hostname}` | Delete a client record |
+| Method | Path | Access | Description |
+|--------|------|--------|-------------|
+| `GET` | `/` | Anonymous | Health check -- returns `{ Status, Version, Timestamp }` |
+| `GET` | `/api/Clients` | Admin group | List clients (paginated: `?skip=0&take=50`, `take` is 1-1000) |
+| `GET` | `/api/Clients/{hostname}` | Admin group | Get a specific client record |
+| `POST` | `/api/Clients` | Own computer account or admin group | Create or update a client (UPSERT) |
+| `PUT` | `/api/Clients/{hostname}` | Own computer account or admin group | Update an existing client |
+| `DELETE` | `/api/Clients/{hostname}` | Admin group | Delete a client record |
+
+The API accepts a record only for the computer account that sends it: `DOMAIN\PC01$` can write the record `PC01` only. Values that do not fit the database are corrected before the write: long strings are shortened to the column length, and dates outside the `smalldatetime` range become NULL.
 
 ### Configuration
 
@@ -579,36 +580,47 @@ Edit `Webservice/ClientHealthApi/appsettings.json`:
 
 ```json
 {
+  "Authentication": {
+    "Mode": "Negotiate",
+    "AdminGroup": "CONTOSO\\ClientHealth Admins"
+  },
   "ConnectionStrings": {
     "ClientHealth": "Server=sccmdbs.contoso.com;Database=ClientHealth;Trusted_Connection=True;TrustServerCertificate=True;"
   }
 }
 ```
 
+| Setting | Values | Default | Description |
+|---------|--------|---------|-------------|
+| `Authentication:Mode` | `Negotiate`, `None` | `Negotiate` | `None` disables authentication. Any caller can then read, change, or delete records. |
+| `Authentication:AdminGroup` | Windows group | `BUILTIN\Administrators` | Members can read and delete all records and write any record. |
+
+The service account needs `db_datareader` and `db_datawriter` on the `ClientHealth` database. The wizard installs the service as LocalSystem, so grant access to the computer account of the API server (`DOMAIN\SERVER$`).
+
 ### Installation
 
-The setup wizard handles this automatically. For manual installation:
+The wizard does this for you. By hand:
 
 ```powershell
 # Publish self-contained
-dotnet publish Webservice/ClientHealthApi/ClientHealthApi.csproj -c Release -o C:\ClientHealthApi --self-contained -r win-x64
+dotnet publish Webservice/ClientHealthApi/ClientHealthApi.csproj -c Release -o 'C:\Program Files\ClientHealthApi' --self-contained -r win-x64
 
 # Install as Windows Service
-sc.exe create ClientHealthApi binPath= "C:\ClientHealthApi\ClientHealthApi.exe --urls=http://*:5000" start= delayed-auto
-sc.exe description ClientHealthApi "ConfigMgr Client Health REST API"
-net start ClientHealthApi
+New-Service -Name ClientHealthApi -BinaryPathName '"C:\Program Files\ClientHealthApi\ClientHealthApi.exe" --urls=http://*:5000' -StartupType Automatic
+New-NetFirewallRule -DisplayName 'ConfigMgr Client Health API (TCP 5000)' -Direction Inbound -Protocol TCP -LocalPort 5000 -Action Allow -Profile Domain
+Start-Service ClientHealthApi
 ```
 
-The webservice can run on any Windows server -- it does not need to be on the site server or SQL server.
+It can run on any Windows server. It doesn't have to be the site server or the SQL server.
 
 ### Example Usage
 
 ```powershell
 # Query a specific client
-Invoke-RestMethod -Uri 'http://sccm01:5000/api/Clients/WORKSTATION-01'
+Invoke-RestMethod -Uri 'http://sccm01:5000/api/Clients/WORKSTATION-01' -UseDefaultCredentials
 
 # List all clients (first 50)
-Invoke-RestMethod -Uri 'http://sccm01:5000/api/Clients?take=50'
+Invoke-RestMethod -Uri 'http://sccm01:5000/api/Clients?take=50' -UseDefaultCredentials
 
 # Health check
 Invoke-RestMethod -Uri 'http://sccm01:5000/'
@@ -655,30 +667,27 @@ The `ClientHealth` database stores one row per managed device. Created by `Creat
 | `RefreshComplianceState` | smalldatetime | Last compliance refresh |
 | `ClientInstalled` | smalldatetime | Client install timestamp |
 | `Version` | varchar(10) | Script version that last ran |
-| `Timestamp` | datetime | Record last updated |
+| `Timestamp` | datetime | Record last updated, in the client's `Logging.TimeFormat` (the API uses server UTC only when the client sends no value) |
 | `HWInventory` | smalldatetime | Last HW inventory |
 | `SWMetering` | varchar(50) | Software metering status |
 | `BITS` | varchar(50) | BITS service status |
 | `PatchLevel` | int | Windows UBR |
 | `ClientInstalledReason` | varchar(200) | Why client was reinstalled |
+| `Findings` | varchar(1000) | Report-only results of the checks, separated by `; ` |
 
 ---
 
 ## Migrating from XML to JSON
 
-The script accepts both formats -- no immediate migration required. To convert:
-
-1. Create a `config.json` based on the template in this repo
-2. Map your XML values to the JSON structure (see [Configuration Reference](#configuration-reference))
-3. Test with `-Config config.json -Verbose`
-4. Deploy the new config alongside the script
-5. The script caches JSON configs locally, so VPN clients will work offline after first run
-
-A conversion helper is included:
+XML still works, so there's no rush. When you want to switch, convert it:
 
 ```powershell
-.\Convert-ConfigXmlToJson.ps1
+.\Convert-ConfigXmlToJson.ps1 -XmlPath .\config.xml
 ```
+
+Test the result with `-Config config.json -Verbose` on one machine before you deploy it.
+
+The converter writes `Client.ManagementPoints` from the `MP=`, `SMSMP=`, or `/mp:` install properties and removes those properties. It does not copy `Client.Share`. If it finds no management point, it shows a warning; add `Client.ManagementPoints` before you deploy the output.
 
 ### Deprecated fields
 
@@ -691,7 +700,7 @@ A conversion helper is included:
 
 ## Remediation Testing (Break Scripts)
 
-The `Tests/BreakScripts/` directory contains scripts that intentionally introduce specific health issues on a lab endpoint so you can validate that the health check detects and remediates each one in isolation.
+`Tests/BreakScripts/` has scripts that break specific things on a lab client, so you can watch the health check find and fix each one.
 
 ### Prerequisites
 
@@ -712,11 +721,11 @@ Every break script checks for this flag and refuses to run without it.
 | `Break-Services.ps1` | Stops BITS and ccmexec, sets wuauserv startup to Disabled | Service monitoring and startup type correction |
 | `Break-SiteCode.ps1` | Reassigns the client to site code `ZZZ` via COM | Site code validation and reassignment |
 | `Break-CacheSize.ps1` | Sets client cache to 1 MB via COM | Cache size detection and correction |
-| `Break-LogSize.ps1` | Sets CCM log max size to 100 KB and history to 0 via registry | Log size and history correction |
+| `Break-LogSize.ps1` | Sets CCM log max size to 100 bytes and history to 0 via registry | Log size and history correction |
 | `Break-ProvisioningMode.ps1` | Enables provisioning mode via registry | Provisioning mode detection and exit |
-| `Break-AdminShares.ps1` | Disables ADMIN$ and C$ shares via `AutoShareWks` registry key | Admin share re-enablement via Server service restart |
+| `Break-AdminShares.ps1` | Deletes the ADMIN$ and C$ shares (`net share /delete`) | Admin share re-creation via Server service restart |
 | `Break-HWInventory.ps1` | Deletes the hardware inventory timestamp from WMI | Stale inventory detection and scan trigger |
-| `Break-WUAHandler.ps1` | Overwrites `registry.pol` with a zero-byte file and backdates it 60 days | WUA handler / GPO corruption detection, `gpupdate` repair |
+| `Break-WUAHandler.ps1` | Overwrites `registry.pol` with a zero-byte file and backdates it 60 days | Corrupt registry.pol detection, `gpupdate` repair |
 | `Break-ComplianceState.ps1` | Sets last compliance state refresh to 61 days ago in registry | Compliance state staleness detection and forced refresh |
 | `Break-LastRun.ps1` | Deletes the `LastRun` registry value used by CI detection | Baseline non-compliance trigger, remediation script execution |
 | `Break-All.ps1` | Runs all 10 break scripts in sequence | Full end-to-end health check and remediation validation |
@@ -731,7 +740,7 @@ $env:YOURLAB = 'true'
 .\Tests\BreakScripts\Get-HealthState.ps1
 ```
 
-This prints a color-coded report of every health item: green for OK, red for broken, yellow for warnings. Save or screenshot this for comparison.
+Green is OK, red is broken, yellow is a warning. Keep the output so you can compare later.
 
 **Step 2: Break one or more items**
 
@@ -761,7 +770,7 @@ You should see red entries for everything you broke.
 .\ConfigMgrClientHealth.ps1 -Config .\config.json -Verbose
 ```
 
-The `-Verbose` flag shows every detection and remediation action in real time. Watch for each broken item being detected and fixed.
+`-Verbose` shows each problem as it's found and fixed.
 
 **Step 5: Verify remediation**
 
@@ -769,18 +778,11 @@ The `-Verbose` flag shows every detection and remediation action in real time. W
 .\Tests\BreakScripts\Get-HealthState.ps1
 ```
 
-All items should be green again. If any remain red, check the log at `%ProgramData%\ConfigMgrClientHealth\ClientHealth.log` (CMTrace format) for details on what failed and why.
+Everything should be green again. Some fixes are asynchronous: hardware inventory, for example, can take a second health run to show up, especially after a site code change. If something stays red, look in `ClientHealth.log` in the `LocalFiles` folder.
 
-### What These Scripts Do NOT Touch
+### What they don't break
 
-These scripts are designed to be safe for lab use:
-
-- No disk partition changes, boot configuration edits, or system file deletion
-- No WMI repository corruption (WMI rebuild is destructive and takes minutes to recover)
-- No client uninstallation (reinstall takes 10+ minutes and requires MP access)
-- No DNS record manipulation (affects network connectivity beyond the client)
-
-If you need to test WMI repair or client reinstallation, those scenarios are better tested by stopping the `winmgmt` service and renaming the WMI repository folder, or by manually uninstalling the client -- both of which require manual revert steps that don't lend themselves to a simple break/fix script.
+They don't touch disks, boot config, system files, DNS records, the WMI repository, or the client install. WMI repair and client reinstall are worth testing, but do that by hand on a VM you can roll back.
 
 ---
 
@@ -795,30 +797,39 @@ If you need to test WMI repair or client reinstallation, those scenarios are bet
 ### Client keeps reinstalling
 
 - **Version mismatch:** The minimum version in config (`Client.Version`) must match what's available. Check `Client.AutoUpgrade` setting.
-- **WMI corrupt:** If WMI is rebuilt, the client is tagged for reinstall. Check `WMI` status in logs.
+- **WMI corrupt:** After a WMI salvage the client is reinstalled. Check the `WMI` status in the log.
+- **Client cache missing:** A missing cached client MSI in `%windir%\Installer` triggers a `/forceinstall` reinstall. Check the `InstallerCache` finding.
 
 ### SQL logging not working
 
 - **Connectivity:** Verify the SQL server is reachable from the client. The script uses Windows Authentication -- the computer account needs `db_datareader` and `db_datawriter` on the `ClientHealth` database.
-- **Module missing:** SQL logging requires the `SqlServer` or `SQLPS` PowerShell module. The `SQLPS` module ships with SQL Server Management Studio.
+- **Modules:** The client script uses the .NET SQL client and needs no PowerShell module. The setup wizard needs the `SqlServer` or `SQLPS` module to create the database.
+
+### Client reinstall does not start
+
+- **Signature check failed:** The log shows `ccmsetup.exe signature status is ...`. The file from the management point is not a valid Microsoft-signed file. Check the `CCM_Client` folder on the management point and any proxy between the client and the management point.
+- **No management point:** Set `Client.ManagementPoints` in the config.
+- **Protected folder:** The log shows `Could not create a protected download folder`. Check the permissions of `%ProgramData%\ConfigMgrClientHealth`.
 
 ### Config caching
 
 - **Cache location:** `%ProgramData%\ConfigMgrClientHealth\config.json.cache`
-- **When used:** The cached copy is loaded automatically when the network config path is unreachable (VPN disconnect, share offline).
+- **When written:** Only after the config passes validation.
+- **When used:** The cached copy is loaded automatically when the network config path is unreachable (VPN disconnect, share offline). The script ignores the cache if the folder is not restricted to SYSTEM and Administrators.
 - **Force refresh:** Delete the cache file to force a fresh load on next run.
 
 ### Baseline shows non-compliant
 
 - **Package not deployed:** The CI remediation script expects files at `%ProgramData%\ConfigMgrClientHealth\`. Deploy the staging package first.
-- **Script errored:** Check the local log at `%ProgramData%\ConfigMgrClientHealth\ClientHealth.log` (CMTrace format).
+- **Untrusted folder:** The CI remediation log shows `is not owned by SYSTEM or Administrators`. Rerun the package program. It secures the folder and restages the files.
+- **Script errored:** Check the local log at `<LocalFiles>\ClientHealth.log` (CMTrace format).
 - **7-day window:** Detection checks if `LastRun` is within 7 days. If the baseline evaluates before the package deploys, it will show non-compliant until the next cycle.
 
 ### Log files
 
 | Log | Location | Format |
 |-----|----------|--------|
-| Client local | `%ProgramData%\ConfigMgrClientHealth\ClientHealth.log` | CMTrace |
+| Client local | `<LocalFiles>\ClientHealth.log` | CMTrace |
 | Network share | `<Logging.Share>\<Hostname>.log` | CMTrace |
 | SQL database | `ClientHealth.dbo.Clients` | Query with SSMS |
 | Webservice | Kestrel console or Windows Event Log | Standard .NET logging |
@@ -835,4 +846,4 @@ This project is licensed under the [Creative Commons Attribution-NoDerivatives 4
 
 - **Anders Rodland** -- Original author ([andersrodland.com](https://www.andersrodland.com))
 - **Chad Miller** -- `Invoke-Sqlcmd2` function
-- **Jason Ulbright** -- Community fork maintainer (security hardening, CIM migration, JSON config, site-aware deployment, automated setup wizard, REST API webservice)
+- **Jason Ulbright** -- this fork

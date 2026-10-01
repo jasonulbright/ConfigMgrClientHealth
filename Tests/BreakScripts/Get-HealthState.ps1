@@ -60,8 +60,8 @@ $logRegPath = 'HKLM:\SOFTWARE\Microsoft\CCM\Logging\@GLOBAL'
 if (Test-Path $logRegPath) {
     $logSize = (Get-ItemProperty -Path $logRegPath -Name 'LogMaxSize' -ErrorAction SilentlyContinue).LogMaxSize
     $logHistory = (Get-ItemProperty -Path $logRegPath -Name 'LogMaxHistory' -ErrorAction SilentlyContinue).LogMaxHistory
-    $logStatus = if ($logSize -ge 1024) { 'OK' } else { 'Bad' }
-    Write-State 'Log MaxSize' "$logSize KB" $logStatus
+    $logStatus = if ($logSize -ge 10000) { 'OK' } else { 'Bad' }
+    Write-State 'Log MaxSize' "$logSize bytes" $logStatus
     Write-State 'Log MaxHistory' $logHistory $(if ($logHistory -ge 1) { 'OK' } else { 'Bad' })
 }
 else { Write-State 'Log Settings' 'Registry path not found' 'Warn' }
@@ -98,7 +98,7 @@ catch { Write-State 'HW Inventory' 'Cannot query WMI' 'Warn' }
 
 # Compliance state
 $chRegPath = 'HKLM:\Software\ConfigMgrClientHealth'
-$lastCompliance = (Get-ItemProperty -Path $chRegPath -Name 'LastComplianceStateSent' -ErrorAction SilentlyContinue).LastComplianceStateSent
+$lastCompliance = (Get-ItemProperty -Path $chRegPath -Name 'RefreshServerComplianceState' -ErrorAction SilentlyContinue).RefreshServerComplianceState
 if ($lastCompliance) {
     $compDays = (New-TimeSpan -Start ([datetime]$lastCompliance) -End (Get-Date)).TotalDays
     $compStatus = if ($compDays -le 30) { 'OK' } else { 'Bad' }
@@ -121,10 +121,13 @@ $registryPol = "$env:windir\System32\GroupPolicy\Machine\registry.pol"
 if (Test-Path $registryPol) {
     $polFile = Get-Item $registryPol
     $polAge = (New-TimeSpan -Start $polFile.LastWriteTime -End (Get-Date)).TotalDays
-    $polStatus = if ($polFile.Length -gt 0 -and $polAge -le 30) { 'OK' } else { 'Bad' }
-    Write-State 'registry.pol' "$($polFile.Length) bytes, $([math]::Round($polAge,1)) days old" $polStatus
+    $header = [byte[]]@()
+    if ($polFile.Length -ge 8) { $header = [System.IO.File]::ReadAllBytes($registryPol)[0..3] }
+    $validHeader = ($header.Count -eq 4) -and ([System.Text.Encoding]::ASCII.GetString($header) -eq 'PReg')
+    $polStatus = if ($validHeader) { 'OK' } else { 'Bad' }
+    Write-State 'registry.pol' "$($polFile.Length) bytes, $([math]::Round($polAge,1)) days old, header $(if ($validHeader) { 'valid' } else { 'invalid' })" $polStatus
 }
-else { Write-State 'registry.pol' 'Not found' 'Warn' }
+else { Write-State 'registry.pol' 'Not found' 'OK' }
 
 # WMI
 Write-Host '-- WMI --' -ForegroundColor White

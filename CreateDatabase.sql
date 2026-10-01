@@ -65,7 +65,8 @@ CREATE TABLE dbo.Clients
     SWMetering varchar(50),
     BITS varchar(50),
     PatchLevel int,
-    ClientInstalledReason varchar(200)
+    ClientInstalledReason varchar(200),
+    Findings varchar(1000)
 )
 else
 
@@ -77,6 +78,7 @@ IF NOT EXISTS (SELECT * FROM sys.columns WHERE  object_id = OBJECT_ID(N'[dbo].[C
 IF NOT EXISTS (SELECT * FROM sys.columns WHERE  object_id = OBJECT_ID(N'[dbo].[Clients]') AND name = 'PatchLevel') ALTER TABLE dbo.Clients ADD PatchLevel int
 IF NOT EXISTS (SELECT * FROM sys.columns WHERE  object_id = OBJECT_ID(N'[dbo].[Clients]') AND name = 'ClientInstalledReason') ALTER TABLE dbo.Clients ADD ClientInstalledReason varchar(200)
 IF NOT EXISTS (SELECT * FROM sys.columns WHERE  object_id = OBJECT_ID(N'[dbo].[Clients]') AND name = 'RefreshComplianceState') ALTER TABLE dbo.Clients ADD RefreshComplianceState smalldatetime
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE  object_id = OBJECT_ID(N'[dbo].[Clients]') AND name = 'Findings') ALTER TABLE dbo.Clients ADD Findings varchar(1000) NULL
 
 
 -- Modify columns if needed

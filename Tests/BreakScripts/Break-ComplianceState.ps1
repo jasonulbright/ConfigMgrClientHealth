@@ -21,10 +21,10 @@ if (-not (Test-Path $regPath)) {
     New-Item -Path $regPath -Force | Out-Null
 }
 
-$current = (Get-ItemProperty -Path $regPath -Name 'LastComplianceStateSent' -ErrorAction SilentlyContinue).LastComplianceStateSent
-Write-Host "[Break-ComplianceState] Current LastComplianceStateSent: $current" -ForegroundColor Gray
+$current = (Get-ItemProperty -Path $regPath -Name 'RefreshServerComplianceState' -ErrorAction SilentlyContinue).RefreshServerComplianceState
+Write-Host "[Break-ComplianceState] Current RefreshServerComplianceState: $current" -ForegroundColor Gray
 
 Write-Host "[Break-ComplianceState] Setting to: $staleDate" -ForegroundColor Yellow
-Set-ItemProperty -Path $regPath -Name 'LastComplianceStateSent' -Value $staleDate -Type String
+Set-ItemProperty -Path $regPath -Name 'RefreshServerComplianceState' -Value $staleDate -Type String
 
 Write-Host '[Break-ComplianceState] Done. Compliance state is now 61 days stale' -ForegroundColor Red

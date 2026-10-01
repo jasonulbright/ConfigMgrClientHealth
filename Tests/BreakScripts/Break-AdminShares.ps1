@@ -1,12 +1,13 @@
 <#
 .SYNOPSIS
-    Disables administrative shares (ADMIN$, C$) via registry.
+    Deletes the administrative shares (ADMIN$, C$) until the next Server service start.
 .DESCRIPTION
     Validates that ConfigMgrClientHealth detects missing admin shares
-    and re-enables them by restarting the Server service.
+    and restores them by restarting the Server service.
 .NOTES
     Run on a LAB endpoint only. Set $env:YOURLAB = 'true' first.
-    Requires a service restart to take effect, which the health script does.
+    Setting AutoShareWks/AutoShareServer to 0 is a policy choice, not a fault. The health script
+    reports that state as 'Disabled' and does not change it, so this script does not use it.
 #>
 #Requires -RunAsAdministrator
 
@@ -15,22 +16,17 @@ if ($env:YOURLAB -ne 'true') {
     exit 1
 }
 
-$regPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
-
-Write-Host '[Break-AdminShares] Disabling AutoShareWks (admin shares)...' -ForegroundColor Yellow
-Set-ItemProperty -Path $regPath -Name 'AutoShareWks' -Value 0 -Type DWord -ErrorAction SilentlyContinue
-# Also set server variant for Server OS
-Set-ItemProperty -Path $regPath -Name 'AutoShareServer' -Value 0 -Type DWord -ErrorAction SilentlyContinue
-
-Write-Host '[Break-AdminShares] Restarting LanmanServer to apply...' -ForegroundColor Yellow
-Restart-Service -Name LanmanServer -Force
+$systemShare = ($env:SystemDrive.TrimEnd(':')) + '$'
+foreach ($share in @('ADMIN$', $systemShare)) {
+    Write-Host "[Break-AdminShares] Deleting share $share..." -ForegroundColor Yellow
+    & net.exe share $share /delete /y 2>&1 | Out-Null
+}
 
 # Verify shares are gone
-Start-Sleep -Seconds 2
-$adminShare = Get-CimInstance -ClassName Win32_Share | Where-Object { $_.Name -eq 'ADMIN$' }
-if ($adminShare) {
-    Write-Host '[Break-AdminShares] Warning: ADMIN$ still present. May need a reboot.' -ForegroundColor Yellow
+$remaining = @(Get-CimInstance -ClassName Win32_Share | Where-Object { $_.Name -in @('ADMIN$', $systemShare) })
+if ($remaining.Count -gt 0) {
+    Write-Host "[Break-AdminShares] Warning: still present: $($remaining.Name -join ', ')" -ForegroundColor Yellow
 }
 else {
-    Write-Host '[Break-AdminShares] Done. Admin shares disabled' -ForegroundColor Red
+    Write-Host '[Break-AdminShares] Done. Admin shares deleted' -ForegroundColor Red
 }

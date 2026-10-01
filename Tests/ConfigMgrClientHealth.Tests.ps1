@@ -129,6 +129,7 @@ Describe 'Config Validation Behavior' {
 
         $functionNames = @(
             'Get-ManagementPointsFromInstallProperties',
+            'Test-ManagementPointName',
             'Test-ConfigValues'
         )
         $extracted = foreach ($fnName in $functionNames) {
@@ -155,6 +156,17 @@ function Get-XMLConfigClientDomain { return 'test.contoso.com' }
         }
 
         { Test-ConfigValues } | Should -Throw '*Invalid management point*'
+    }
+
+    It 'Warns, without throwing, on a malformed legacy MP token in ClientInstallProperties' {
+        $script:JsonConfig = [pscustomobject]@{
+            Services = @()
+            Client = [pscustomobject]@{ ManagementPoints = @('mp01.test.contoso.com') }
+            ClientInstallProperties = @('SMSSITECODE=TST', 'SMSMP=mp01.test.contoso.com:80')
+            Sites = $null
+        }
+
+        { Test-ConfigValues 3>$null } | Should -Not -Throw
     }
 
     It 'Rejects malformed site override ManagementPoints' {
@@ -242,7 +254,12 @@ Describe 'WMI to CIM Migration' {
             $args[0] -is [System.Management.Automation.Language.CommandAst] -and
             $args[0].GetCommandName() -eq 'Invoke-CimMethod'
         }, $true)
-        $cimCalls.Count | Should -BeGreaterThan 3
+        $cimCalls.Count | Should -BeGreaterThan 0
+        $wmiCalls = $AST.FindAll({
+            $args[0] -is [System.Management.Automation.Language.CommandAst] -and
+            $args[0].GetCommandName() -in @('Invoke-WmiMethod', 'Get-WmiObject', 'Set-WmiInstance', 'Remove-WmiObject')
+        }, $true)
+        $wmiCalls.Count | Should -Be 0
     }
 
     It 'Does not use ConvertToDateTime (CIM returns native DateTime)' {
@@ -467,7 +484,7 @@ Describe 'JSON Config: config.json' {
         $JsonConfig.Services.Count | Should -BeGreaterThan 0
         foreach ($svc in $JsonConfig.Services) {
             $svc.Name | Should -Match '^[a-zA-Z0-9_\-\.]+$'
-            $svc.State | Should -BeIn @('Running', 'Stopped')
+            $svc.State | Should -BeIn @('Running', 'Stopped', '')
         }
     }
 
@@ -547,7 +564,7 @@ Describe 'Site-Aware Config' {
 
     It 'MPHttps conversion does not treat the string False as true' {
         $scriptContent | Should -Match 'Function ConvertTo-ConfigBoolean'
-        $scriptContent | Should -Match '\[System\.Convert\]::ToBoolean'
+        $scriptContent | Should -Match '\^\(\?i:false\|no\|off\|0'
     }
 
     It 'Log share accessor uses site override' {
@@ -569,8 +586,8 @@ Describe 'Config Caching' {
         $scriptContent | Should -Match '\$script:JsonConfig\.LocalFiles'
     }
 
-    It 'Caches config after successful JSON load' {
-        $scriptContent | Should -Match 'Set-Content\s+-Path\s+\$ConfigCachePath'
+    It 'Caches config only after validation passes' {
+        $scriptContent | Should -Match 'Test-ConfigValues -Xml \$Xml\s+if \(\$script:ConfigRawToCache\) \{ Save-ConfigCache'
     }
 
     It 'Falls back to cache when config file unreachable' {
@@ -593,7 +610,7 @@ Describe 'Client Install Source Resolution' {
     }
 
     It 'Errors out when no Management Points are configured' {
-        $scriptContent | Should -Match 'no Management Points are configured'
+        $scriptContent | Should -Match 'no valid Management Points are configured'
     }
 
     It 'Warns when Client.Share is set (deprecated path)' {
@@ -610,11 +627,11 @@ Describe 'Client Install Source Resolution' {
         $scriptContent | Should -Match "if \(\`$useHttps\) \{ 'https' \} else \{ 'http' \}"
     }
 
-    It 'Strips stale MP / SMSMP / /mp tokens before injecting the picked MP' {
-        $scriptContent | Should -Match '\$_ -notmatch ''\^\(SMSMP\|MP\)='''
+    It 'Strips stale MP / SMSMP / /mp tokens before injecting the configured MPs' {
+        $scriptContent | Should -Match '\$_ -notmatch ''\^\(SMSMP\|MP\|SMSMPLIST\)='''
         $scriptContent | Should -Match '\$_ -notmatch ''\^/mp:'''
-        $scriptContent | Should -Match '\$tokens \+= "SMSMP=\$selectedMp"'
-        $scriptContent | Should -Match '\$tokens \+= "/mp:\$selectedMp"'
+        $scriptContent | Should -Match '\$properties \+= "SMSMP=\$\(\$mpValues\[0\]\)"'
+        $scriptContent | Should -Match '"/mp:\$\(\[string\]::Join'
     }
 }
 

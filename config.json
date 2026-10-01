@@ -39,7 +39,7 @@
     },
     "Options": {
         "CcmSQLCELog": false,
-        "BITSCheck": { "Enable": true, "Fix": true },
+        "BITSCheck": { "Enable": true, "Fix": true, "Days": 7 },
         "ClientSettingsCheck": { "Enable": true, "Fix": true },
         "DNSCheck": { "Enable": true, "Fix": true },
         "Drivers": true,
@@ -66,12 +66,26 @@
         },
         "SoftwareMetering": { "Enable": true, "Fix": true },
         "WMI": { "Enable": true, "Fix": true },
-        "RefreshComplianceState": { "Enable": true, "Days": 30 }
+        "RefreshComplianceState": { "Enable": true, "Days": 30 },
+        "CcmEvalTask": { "Enable": true, "Fix": true },
+        "ClientActivity": { "Enable": true, "Fix": true, "Days": 7 },
+        "WindowsUpdateSource": { "Enable": true, "Fix": true },
+        "WindowsUpdateScan": { "Enable": true, "Fix": false, "ResetDays": 30 },
+        "TlsConfiguration": { "Enable": true, "Fix": false },
+        "CoManagement": { "Enable": true },
+        "SecureChannel": { "Enable": true },
+        "ScriptPolicy": { "Enable": true },
+        "SiteCommunication": { "Enable": true },
+        "PkiCertificate": { "Enable": false, "Days": 30 },
+        "ClientIdentity": { "Enable": true },
+        "DeliveryOptimization": { "Enable": true },
+        "InstallerCache": { "Enable": true, "Fix": true },
+        "VCRuntime": { "Enable": true, "Fix": true }
     },
     "Services": [
-        { "Name": "BITS",          "StartupType": "Automatic (Delayed Start)", "State": "Running", "Uptime": "" },
+        { "Name": "BITS",          "StartupType": "Manual|Automatic|Automatic (Delayed Start)", "State": "", "Uptime": "" },
         { "Name": "winmgmt",       "StartupType": "Automatic",                 "State": "Running", "Uptime": "" },
-        { "Name": "wuauserv",      "StartupType": "Automatic (Delayed Start)", "State": "Running", "Uptime": "" },
+        { "Name": "wuauserv",      "StartupType": "Manual|Automatic|Automatic (Delayed Start)", "State": "", "Uptime": "" },
         { "Name": "lanmanserver",  "StartupType": "Automatic",                 "State": "Running", "Uptime": "" },
         { "Name": "RpcSs",         "StartupType": "Automatic",                 "State": "Running", "Uptime": "" },
         { "Name": "W32Time",       "StartupType": "Automatic",                 "State": "Running", "Uptime": "" },
@@ -81,7 +95,7 @@
         "AdminShare": true,
         "ClientProvisioningMode": true,
         "ClientStateMessages": true,
-        "ClientWUAHandler": { "Fix": true, "Days": 30 },
+        "ClientWUAHandler": { "Fix": true, "Days": 7 },
         "ClientCertificate": true
     },
     "Sites": {

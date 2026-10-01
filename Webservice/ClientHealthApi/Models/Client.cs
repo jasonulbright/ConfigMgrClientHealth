@@ -35,9 +35,9 @@ public class Client
     [MaxLength(100)]
     public string? ClientVersion { get; set; }
 
-    public double PSVersion { get; set; }
+    public double? PSVersion { get; set; }
 
-    public int PSBuild { get; set; }
+    public int? PSBuild { get; set; }
 
     [MaxLength(3)]
     public string? Sitecode { get; set; }
@@ -45,11 +45,11 @@ public class Client
     [MaxLength(100)]
     public string? Domain { get; set; }
 
-    public int MaxLogSize { get; set; }
+    public int? MaxLogSize { get; set; }
 
-    public int MaxLogHistory { get; set; }
+    public int? MaxLogHistory { get; set; }
 
-    public int CacheSize { get; set; }
+    public int? CacheSize { get; set; }
 
     [MaxLength(50)]
     public string? ClientCertificate { get; set; }
@@ -71,7 +71,7 @@ public class Client
 
     public DateTime? LastBootTime { get; set; }
 
-    public double OSDiskFreeSpace { get; set; }
+    public double? OSDiskFreeSpace { get; set; }
 
     [MaxLength(200)]
     public string? Services { get; set; }
@@ -105,8 +105,11 @@ public class Client
     [MaxLength(50)]
     public string? BITS { get; set; }
 
-    public int PatchLevel { get; set; }
+    public int? PatchLevel { get; set; }
 
     [MaxLength(200)]
     public string? ClientInstalledReason { get; set; }
+
+    [MaxLength(1000)]
+    public string? Findings { get; set; }
 }

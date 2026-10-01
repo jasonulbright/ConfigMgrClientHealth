@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Interactive setup wizard for ConfigMgr Client Health.
 
@@ -130,6 +130,26 @@ function Test-ManagementPointName {
     return $true
 }
 
+function Test-IsLocalComputer {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    $candidate = $Name.Trim().TrimEnd('.')
+    $localNames = @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1', '::1')
+    try { $localNames += [System.Net.Dns]::GetHostEntry('localhost').HostName } catch { }
+    try { $localNames += [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName } catch { }
+    if ($env:USERDNSDOMAIN) { $localNames += "$env:COMPUTERNAME.$env:USERDNSDOMAIN" }
+    return ($localNames | Where-Object { $_ -and ($_ -eq $candidate) }).Count -gt 0
+}
+
+function Get-DefaultLogWriterPrincipal {
+    if ($env:USERDOMAIN -and $env:USERDOMAIN -ne $env:COMPUTERNAME) {
+        return "$env:USERDOMAIN\Domain Computers"
+    }
+
+    return 'NT AUTHORITY\Authenticated Users'
+}
+
 function Get-DefaultSqlAccessPrincipal {
     if ($env:USERDOMAIN -and $env:USERDOMAIN -ne $env:COMPUTERNAME) {
         return "$env:USERDOMAIN\Domain Computers"
@@ -196,7 +216,7 @@ function New-ClientHealthConfig {
         }
         Options                = [ordered]@{
             CcmSQLCELog          = $false
-            BITSCheck             = [ordered]@{ Enable = $true; Fix = $true }
+            BITSCheck             = [ordered]@{ Enable = $true; Fix = $true; Days = 7 }
             ClientSettingsCheck   = [ordered]@{ Enable = $true; Fix = $true }
             DNSCheck              = [ordered]@{ Enable = $true; Fix = $true }
             Drivers               = $true
@@ -210,11 +230,25 @@ function New-ClientHealthConfig {
             SoftwareMetering      = [ordered]@{ Enable = $true; Fix = $true }
             WMI                   = [ordered]@{ Enable = $true; Fix = $true }
             RefreshComplianceState = [ordered]@{ Enable = $true; Days = 30 }
+            CcmEvalTask           = [ordered]@{ Enable = $true; Fix = $true }
+            ClientActivity        = [ordered]@{ Enable = $true; Fix = $true; Days = 7 }
+            WindowsUpdateSource   = [ordered]@{ Enable = $true; Fix = $true }
+            WindowsUpdateScan     = [ordered]@{ Enable = $true; Fix = $false; ResetDays = 30 }
+            TlsConfiguration      = [ordered]@{ Enable = $true; Fix = $false }
+            CoManagement          = [ordered]@{ Enable = $true }
+            SecureChannel         = [ordered]@{ Enable = $true }
+            ScriptPolicy          = [ordered]@{ Enable = $true }
+            SiteCommunication     = [ordered]@{ Enable = $true }
+            PkiCertificate        = [ordered]@{ Enable = $false; Days = 30 }
+            ClientIdentity        = [ordered]@{ Enable = $true }
+            DeliveryOptimization  = [ordered]@{ Enable = $true }
+            InstallerCache        = [ordered]@{ Enable = $true; Fix = $true }
+            VCRuntime             = [ordered]@{ Enable = $true; Fix = $true }
         }
         Services               = @(
-            [ordered]@{ Name = 'BITS';         StartupType = 'Automatic (Delayed Start)'; State = 'Running'; Uptime = '' }
+            [ordered]@{ Name = 'BITS';         StartupType = 'Manual|Automatic|Automatic (Delayed Start)'; State = ''; Uptime = '' }
             [ordered]@{ Name = 'winmgmt';      StartupType = 'Automatic';                 State = 'Running'; Uptime = '' }
-            [ordered]@{ Name = 'wuauserv';     StartupType = 'Automatic (Delayed Start)'; State = 'Running'; Uptime = '' }
+            [ordered]@{ Name = 'wuauserv';     StartupType = 'Manual|Automatic|Automatic (Delayed Start)'; State = ''; Uptime = '' }
             [ordered]@{ Name = 'lanmanserver'; StartupType = 'Automatic';                 State = 'Running'; Uptime = '' }
             [ordered]@{ Name = 'RpcSs';        StartupType = 'Automatic';                 State = 'Running'; Uptime = '' }
             [ordered]@{ Name = 'W32Time';      StartupType = 'Automatic';                 State = 'Running'; Uptime = '' }
@@ -224,7 +258,7 @@ function New-ClientHealthConfig {
             AdminShare             = $true
             ClientProvisioningMode = $true
             ClientStateMessages    = $true
-            ClientWUAHandler       = [ordered]@{ Fix = $true; Days = 30 }
+            ClientWUAHandler       = [ordered]@{ Fix = $true; Days = 7 }
             ClientCertificate      = $true
         }
         Sites                  = [ordered]@{ Default = [ordered]@{} }
@@ -233,6 +267,30 @@ function New-ClientHealthConfig {
     $json = $config | ConvertTo-Json -Depth 5
     Set-Content -Path $OutputFile -Value $json -Encoding UTF8 -Force
     return $OutputFile
+}
+
+function Get-SqlScriptBatch {
+    <#
+    .SYNOPSIS
+        Splits a SQL script on GO and returns each batch with the database it must run in.
+    .NOTES
+        Every Invoke-Sqlcmd call opens a new session, so a USE statement does not carry over to
+        the next batch. The USE target is tracked here and passed as -Database instead.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $database = 'master'
+    $content = Get-Content -Path $Path -Raw
+    foreach ($batch in ($content -split '(?m)^\s*GO\s*$')) {
+        $useMatches = [regex]::Matches($batch, '(?im)^\s*USE\s+\[?(?<db>[A-Za-z0-9_]+)\]?\s*;?\s*$')
+        if ($useMatches.Count -gt 0) { $database = $useMatches[$useMatches.Count - 1].Groups['db'].Value }
+        $query = [regex]::Replace($batch, '(?im)^\s*USE\s+\[?[A-Za-z0-9_]+\]?\s*;?\s*$', '')
+
+        $code = [regex]::Replace($query, '(?m)--.*$', '').Trim()
+        if ($code -eq '') { continue }
+
+        [pscustomobject]@{ Database = $database; Query = $query }
+    }
 }
 
 function New-ClientHealthDatabase {
@@ -254,12 +312,12 @@ function New-ClientHealthDatabase {
     $moduleName = if (Get-Module -ListAvailable -Name SqlServer) { 'SqlServer' } else { 'SQLPS' }
     Import-Module $moduleName -ErrorAction Stop
 
-    $sqlContent = Get-Content -Path $SqlScriptPath -Raw
-    # Split on GO statements for batch execution
-    $batches = $sqlContent -split '(?m)^\s*GO\s*$' | Where-Object { $_.Trim() -ne '' }
+    $sqlArgs = @{ ServerInstance = $SqlServer; ErrorAction = 'Stop' }
+    # SqlServer module 22+ encrypts by default and rejects a self-signed server certificate.
+    if ((Get-Command Invoke-Sqlcmd).Parameters.ContainsKey('TrustServerCertificate')) { $sqlArgs.TrustServerCertificate = $true }
 
-    foreach ($batch in $batches) {
-        Invoke-Sqlcmd -ServerInstance $SqlServer -Query $batch -ErrorAction Stop
+    foreach ($batch in (Get-SqlScriptBatch -Path $SqlScriptPath)) {
+        Invoke-Sqlcmd @sqlArgs -Database $batch.Database -Query $batch.Query
     }
 
     if ([string]::IsNullOrWhiteSpace($AccessPrincipal)) {
@@ -280,7 +338,7 @@ IF IS_ROLEMEMBER('db_datareader', N'$principalName') = 0
 IF IS_ROLEMEMBER('db_datawriter', N'$principalName') = 0
     ALTER ROLE db_datawriter ADD MEMBER [$principalIdentifier];
 "@
-    Invoke-Sqlcmd -ServerInstance $SqlServer -Query $grantSql -ErrorAction Stop
+    Invoke-Sqlcmd @sqlArgs -Database 'master' -Query $grantSql
 }
 
 function New-FileShare {
@@ -309,8 +367,7 @@ function New-FileShare {
         return
     }
 
-    $isLocal = ($server -eq $env:COMPUTERNAME) -or ($server -eq 'localhost') -or ($server -eq '.')
-    if (-not $isLocal) {
+    if (-not (Test-IsLocalComputer -Name $server)) {
         throw "Share $UncPath does not exist and cannot be created remotely. Create the share on $server first, then re-run."
     }
 
@@ -425,6 +482,9 @@ function New-MECMObjects {
         }
         else {
             Write-Host "  Package already exists: $($pkg.PackageID)" -ForegroundColor Yellow
+            # Without this, re-running the wizard copies new files to the source share but DPs keep the old content.
+            Update-CMDistributionPoint -PackageId $pkg.PackageID -ErrorAction Stop
+            Write-Host '  Distribution points updated with current package source' -ForegroundColor Green
         }
 
         $program = Get-CMProgram -PackageId $pkg.PackageID -ProgramName 'Deploy' -ErrorAction SilentlyContinue
@@ -440,12 +500,20 @@ function New-MECMObjects {
 
         # Distribute to all DPs
         Write-Host '  Distributing content to all DP groups...' -ForegroundColor Gray
-        $dpGroups = Get-CMDistributionPointGroup
-        foreach ($dpg in $dpGroups) {
-            Start-CMContentDistribution -PackageId $pkg.PackageID `
-                -DistributionPointGroupName $dpg.Name -ErrorAction SilentlyContinue
+        $dpGroups = @(Get-CMDistributionPointGroup)
+        if ($dpGroups.Count -eq 0) {
+            Write-Warning '  No distribution point groups exist. Distribute the package manually.'
         }
-        Write-Host "  Content distributed to $($dpGroups.Count) DP group(s)" -ForegroundColor Green
+        foreach ($dpg in $dpGroups) {
+            try {
+                Start-CMContentDistribution -PackageId $pkg.PackageID -DistributionPointGroupName $dpg.Name -ErrorAction Stop
+                Write-Host "  Content distributed to DP group: $($dpg.Name)" -ForegroundColor Green
+            }
+            catch {
+                # Expected on re-run: content is already targeted to this group.
+                Write-Host "  DP group '$($dpg.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
 
         # ── Configuration Item ──
         Write-Host '  Creating Configuration Item...' -ForegroundColor Gray
@@ -454,28 +522,40 @@ function New-MECMObjects {
         if (-not $ci) {
             $ci = New-CMConfigurationItem -Name $ciName `
                 -Description 'Detects whether ConfigMgr Client Health has run within the last 7 days and remediates if not.' `
-                -CreationType WindowsOS
+                -CreationType WindowsOS -ErrorAction Stop
 
-            # Add discovery + remediation scripts with inline compliance rule
-            Add-CMComplianceSettingScript -InputObject $ci `
-                -Name 'ClientHealth LastRun Check' `
-                -DataType Boolean `
-                -DiscoveryScriptLanguage PowerShell `
-                -DiscoveryScriptText $DetectionScript `
-                -RemediationScriptLanguage PowerShell `
-                -RemediationScriptText $RemediationScript `
-                -Is64Bit `
-                -ValueRule `
-                -RuleName 'ClientHealth ran within 7 days' `
-                -ExpectedValue 'True' `
-                -ExpressionOperator IsEquals `
-                -ReportNoncompliance `
-                -Remediate
+            # Add discovery + remediation scripts with inline compliance rule.
+            # A CI without its setting is never non-compliant, and a re-run would skip it as existing.
+            try {
+                Add-CMComplianceSettingScript -InputObject $ci `
+                    -Name 'ClientHealth LastRun Check' `
+                    -DataType Boolean `
+                    -DiscoveryScriptLanguage PowerShell `
+                    -DiscoveryScriptText $DetectionScript `
+                    -RemediationScriptLanguage PowerShell `
+                    -RemediationScriptText $RemediationScript `
+                    -Is64Bit `
+                    -ValueRule `
+                    -RuleName 'ClientHealth ran within 7 days' `
+                    -ExpectedValue 'True' `
+                    -ExpressionOperator IsEquals `
+                    -ReportNoncompliance `
+                    -Remediate `
+                    -ErrorAction Stop | Out-Null
+            }
+            catch {
+                Remove-CMConfigurationItem -Id $ci.CI_ID -Force -ErrorAction SilentlyContinue
+                throw "Could not add the compliance script to '$ciName'; the CI was removed. $($_.Exception.Message)"
+            }
 
             Write-Host "  CI created: $ciName" -ForegroundColor Green
         }
         else {
-            Write-Host "  CI already exists: $ciName" -ForegroundColor Yellow
+            Set-CMComplianceSettingScript -InputObject $ci -SettingName 'ClientHealth LastRun Check' `
+                -DiscoveryScriptLanguage PowerShell -DiscoveryScriptText $DetectionScript `
+                -RemediationScriptLanguage PowerShell -RemediationScriptText $RemediationScript `
+                -Is64Bit $true -ErrorAction Stop | Out-Null
+            Write-Host "  CI already exists: $ciName (detection and remediation scripts updated)" -ForegroundColor Yellow
         }
 
         # ── Configuration Baseline ──
@@ -496,8 +576,9 @@ function New-MECMObjects {
 
         # ── Deploy Baseline ──
         Write-Host "  Deploying baseline to '$TargetCollection'..." -ForegroundColor Gray
-        $existingDeployment = Get-CMBaselineDeployment -Name $cbName -ErrorAction SilentlyContinue |
-            Where-Object { $_.CollectionName -eq $TargetCollection }
+        # SMS_BaselineAssignment has TargetCollectionID but no CollectionName property; filtering the
+        # returned objects on CollectionName matches nothing and creates a duplicate deployment.
+        $existingDeployment = Get-CMBaselineDeployment -Name $cbName -CollectionName $TargetCollection -Fast -ErrorAction SilentlyContinue
         if (-not $existingDeployment) {
             New-CMBaselineDeployment -Name $cbName `
                 -CollectionName $TargetCollection `
@@ -515,17 +596,30 @@ function New-MECMObjects {
 
         # ── Deploy Package ──
         Write-Host "  Deploying package to '$TargetCollection'..." -ForegroundColor Gray
-        New-CMPackageDeployment -PackageId $pkg.PackageID `
-            -ProgramName 'Deploy' `
-            -CollectionName $TargetCollection `
-            -StandardProgram `
-            -DeployPurpose Required `
-            -FastNetworkOption DownloadContentFromDistributionPointAndRunLocally `
-            -SlowNetworkOption DownloadContentFromDistributionPointAndLocally `
-            -RerunBehavior RerunIfFailedPreviousAttempt `
-            -Schedule (New-CMSchedule -RecurInterval Days -RecurCount 7) `
-            -ErrorAction SilentlyContinue | Out-Null
-        Write-Host "  Package deployment created" -ForegroundColor Green
+        $existingPackageDeployment = Get-CMPackageDeployment -PackageId $pkg.PackageID -CollectionName $TargetCollection -ErrorAction SilentlyContinue
+        if ($existingPackageDeployment) {
+            # A deployment that reruns only after a failure leaves clients on the old staged files.
+            # The program only copies files, so it may run outside maintenance windows.
+            Set-CMPackageDeployment -PackageId $pkg.PackageID -StandardProgramName 'Deploy' `
+                -CollectionName $TargetCollection -RerunBehavior AlwaysRerunProgram -SoftwareInstallation $true -ErrorAction Stop
+            Write-Host "  Package deployment already exists for: $TargetCollection (rerun always, runs outside maintenance windows)" -ForegroundColor Yellow
+        }
+        else {
+            # The weekly recurrence must restage changed config. The program only copies files,
+            # so it may run outside maintenance windows.
+            New-CMPackageDeployment -PackageId $pkg.PackageID `
+                -ProgramName 'Deploy' `
+                -CollectionName $TargetCollection `
+                -StandardProgram `
+                -DeployPurpose Required `
+                -FastNetworkOption DownloadContentFromDistributionPointAndRunLocally `
+                -SlowNetworkOption DownloadContentFromDistributionPointAndLocally `
+                -RerunBehavior AlwaysRerunProgram `
+                -SoftwareInstallation $true `
+                -Schedule (New-CMSchedule -RecurInterval Days -RecurCount 7) `
+                -ErrorAction Stop | Out-Null
+            Write-Host "  Package deployment created" -ForegroundColor Green
+        }
     }
     finally {
         Set-Location $originalLocation
@@ -560,37 +654,71 @@ function Install-ClientHealthWebservice {
     # Update appsettings.json with real connection string
     $appSettings = Join-Path $publishDir 'appsettings.json'
     $settings = Get-Content $appSettings -Raw | ConvertFrom-Json
-    $settings.ConnectionStrings.ClientHealth = "Server=$SqlServer;Database=ClientHealth;Trusted_Connection=True;TrustServerCertificate=True;"
+    # Microsoft.Data.SqlClient encrypts by default. Validate the SQL certificate when this machine trusts it;
+    # fall back to TrustServerCertificate only for a self-signed SQL certificate.
+    $validatedConnection = "Server=$SqlServer;Database=ClientHealth;Trusted_Connection=True;Encrypt=True;TrustServerCertificate=False;"
+    $probe = New-Object System.Data.SqlClient.SqlConnection("Server=$SqlServer;Database=master;Integrated Security=True;Encrypt=True;TrustServerCertificate=False;Connect Timeout=10;")
+    try {
+        $probe.Open()
+        $settings.ConnectionStrings.ClientHealth = $validatedConnection
+        Write-Host '  SQL certificate validated; the API connection checks it' -ForegroundColor Green
+    }
+    catch {
+        $settings.ConnectionStrings.ClientHealth = "Server=$SqlServer;Database=ClientHealth;Trusted_Connection=True;Encrypt=True;TrustServerCertificate=True;"
+        Write-Warning "  SQL certificate on $SqlServer is not trusted by this machine. The API encrypts but does not validate the certificate. Install a trusted certificate on SQL Server and set TrustServerCertificate=False in appsettings.json."
+    }
+    finally { $probe.Dispose() }
     $settings | ConvertTo-Json -Depth 5 | Set-Content $appSettings -Encoding UTF8 -Force
 
-    $isLocal = ($TargetServer -eq $env:COMPUTERNAME) -or ($TargetServer -eq 'localhost')
     $installPath = "C:\Program Files\ClientHealthApi"
+    $svcName = 'ClientHealthApi'
+    $binaryPath = "`"$(Join-Path $installPath 'ClientHealthApi.exe')`" --urls=http://*:$Port"
 
-    if ($isLocal) {
+    if (Test-IsLocalComputer -Name $TargetServer) {
         # Local install
         if (-not (Test-Path $installPath)) {
             New-Item -Path $installPath -ItemType Directory -Force | Out-Null
         }
+        $existing = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($existing -and $existing.Status -ne 'Stopped') { Stop-Service -Name $svcName -Force -ErrorAction Stop }
         Copy-Item -Path "$publishDir\*" -Destination $installPath -Recurse -Force
 
-        # Install as Windows Service
-        $svcName = 'ClientHealthApi'
-        $existing = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        # New-Service passes the path unchanged; sc.exe binPath= with embedded quotes is mangled by Windows PowerShell 5.1.
         if (-not $existing) {
-            $exePath = Join-Path $installPath 'ClientHealthApi.exe'
-            & sc.exe create $svcName binPath= "`"$exePath`" --urls=http://*:$Port" start= delayed-auto 2>&1 | Out-Null
-            & sc.exe description $svcName "ConfigMgr Client Health REST API" 2>&1 | Out-Null
-            Start-Service -Name $svcName
-            Write-Host "  Service '$svcName' installed and started on port $Port" -ForegroundColor Green
+            New-Service -Name $svcName -BinaryPathName $binaryPath -DisplayName 'ConfigMgr Client Health API' `
+                -Description 'ConfigMgr Client Health REST API' -StartupType Automatic -ErrorAction Stop | Out-Null
+            & sc.exe config $svcName start= delayed-auto | Out-Null
+            Write-Host "  Service '$svcName' installed" -ForegroundColor Green
         }
         else {
-            Write-Host "  Service '$svcName' already exists" -ForegroundColor Yellow
+            # Win32_Service.Change takes the path unchanged; a re-run with another port must update --urls.
+            $serviceInstance = Get-CimInstance -ClassName Win32_Service -Filter "Name='$svcName'"
+            $change = Invoke-CimMethod -InputObject $serviceInstance -MethodName Change -Arguments @{ PathName = $binaryPath }
+            if ($change.ReturnValue -ne 0) { throw "Could not update the service path (Win32_Service.Change returned $($change.ReturnValue))." }
+            Write-Host "  Service '$svcName' already exists; binaries and path updated" -ForegroundColor Yellow
         }
+
+        $ruleName = "ConfigMgr Client Health API (TCP $Port)"
+        Get-NetFirewallRule -DisplayName 'ConfigMgr Client Health API (TCP *)' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -ne $ruleName } |
+            ForEach-Object {
+                Remove-NetFirewallRule -Name $_.Name -ErrorAction Stop
+                Write-Host "  Firewall rule removed: $($_.DisplayName)" -ForegroundColor Yellow
+            }
+        if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow -Profile Domain -ErrorAction Stop | Out-Null
+            Write-Host "  Firewall rule created: $ruleName" -ForegroundColor Green
+        }
+
+        Start-Service -Name $svcName -ErrorAction Stop
+        Write-Host "  Service '$svcName' running on port $Port" -ForegroundColor Green
     }
     else {
         Write-Host "  Published files are in: $publishDir" -ForegroundColor Green
-        Write-Host "  Copy them to $TargetServer and run:" -ForegroundColor Yellow
-        Write-Host "    sc.exe create ClientHealthApi binPath= `"C:\Program Files\ClientHealthApi\ClientHealthApi.exe --urls=http://*:$Port`" start= delayed-auto" -ForegroundColor Yellow
+        Write-Host "  Copy them to '$installPath' on $TargetServer, then run there:" -ForegroundColor Yellow
+        Write-Host "    New-Service -Name $svcName -BinaryPathName '$binaryPath' -StartupType Automatic" -ForegroundColor Yellow
+        Write-Host "    New-NetFirewallRule -DisplayName 'ConfigMgr Client Health API (TCP $Port)' -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow -Profile Domain" -ForegroundColor Yellow
+        Write-Host "    Start-Service $svcName" -ForegroundColor Yellow
     }
 }
 
@@ -733,6 +861,19 @@ function Start-ClientHealthWizard {
         }
     }
 
+    if (-not $interactive) {
+        # The interactive prompts validate each value; parameters bypass the prompts. A bad site code or
+        # domain in config.json makes Test-ConfigValues throw on every client.
+        $problems = @()
+        if ($SiteCode -notmatch '\A[A-Za-z0-9]{3}\z') { $problems += "SiteCode '$SiteCode' must be exactly 3 alphanumeric characters." }
+        if ($Domain -notmatch '\A[A-Za-z0-9.-]+\z' -or $Domain -notmatch '\.') { $problems += "Domain '$Domain' must be a DNS domain name." }
+        if ($ClientVersion -notmatch '\A\d+\.\d+\.\d+\.\d+\z') { $problems += "ClientVersion '$ClientVersion' must be in format X.XX.XXXX.XXXX." }
+        if ([string]::IsNullOrWhiteSpace($SqlServer)) { $problems += 'SqlServer is required.' }
+        if ($LogSharePath -notmatch '\A\\\\[^\\]+\\[^\\]+') { $problems += "LogSharePath '$LogSharePath' must be a UNC path." }
+        if ($ClientSharePath -notmatch '\A\\\\[^\\]+\\[^\\]+') { $problems += "ClientSharePath '$ClientSharePath' must be a UNC path." }
+        if ($problems.Count -gt 0) { throw ("Invalid parameters:`n  " + ($problems -join "`n  ")) }
+    }
+
     # ── Phase 2: Generate config.json ──
     Write-Banner 'Phase 2: Generating config.json'
     if (-not $OutputPath) { $OutputPath = Join-Path $SourceRoot 'Deploy\Output' }
@@ -768,7 +909,7 @@ function Start-ClientHealthWizard {
     try { New-FileShare -UncPath $ClientSharePath -Description 'ConfigMgr Client Health - Client Files' }
     catch { Write-Warning "  Client share: $_" }
 
-    try { New-FileShare -UncPath $LogSharePath -Description 'ConfigMgr Client Health - Logs' -ChangeAccess 'Everyone' }
+    try { New-FileShare -UncPath $LogSharePath -Description 'ConfigMgr Client Health - Logs' -ChangeAccess (Get-DefaultLogWriterPrincipal) }
     catch { Write-Warning "  Log share: $_" }
 
     Copy-SourceFiles -SourceRoot $SourceRoot -TargetPath $ClientSharePath -ConfigFile $configFile

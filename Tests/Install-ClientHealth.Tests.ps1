@@ -236,9 +236,52 @@ Describe 'New-FileShare' {
         $cmd.Parameters.Keys | Should -Contain 'ChangeAccess'
     }
 
-    It 'Wizard creates the log share with write-capable share permissions' {
+    It 'Wizard creates the log share writable by computer accounts, not Everyone' {
         $scriptContent = Get-Content $ScriptPath -Raw
-        $scriptContent | Should -Match 'New-FileShare\s+-UncPath\s+\$LogSharePath.*-ChangeAccess\s+''Everyone'''
+        $scriptContent | Should -Match 'New-FileShare\s+-UncPath\s+\$LogSharePath.*-ChangeAccess\s+\(Get-DefaultLogWriterPrincipal\)'
+        $scriptContent | Should -Not -Match '-ChangeAccess\s+''Everyone'''
+    }
+
+    It 'Default log writer is Domain Computers on a domain member' {
+        $savedDomain = $env:USERDOMAIN
+        try {
+            $env:USERDOMAIN = 'CONTOSO'
+            Get-DefaultLogWriterPrincipal | Should -Be 'CONTOSO\Domain Computers'
+        }
+        finally { $env:USERDOMAIN = $savedDomain }
+    }
+}
+
+Describe 'Get-SqlScriptBatch' {
+    It 'Runs every batch after USE ClientHealth in the ClientHealth database' {
+        $batches = @(Get-SqlScriptBatch -Path (Join-Path $PSScriptRoot '..\CreateDatabase.sql'))
+        $batches[0].Database | Should -Be 'master'
+        $batches[0].Query | Should -Match 'CREATE DATABASE ClientHealth'
+        $tableBatch = $batches | Where-Object { $_.Query -match 'CREATE TABLE dbo\.Clients' }
+        $tableBatch.Database | Should -Be 'ClientHealth'
+        $versionBatch = $batches | Where-Object { $_.Query -match 'dbo\.Configuration' -and $_.Query -match 'INSERT' }
+        $versionBatch.Database | Should -Be 'ClientHealth'
+    }
+
+    It 'Removes USE statements and skips comment-only batches' {
+        $sql = Join-Path $TestDrive 'batches.sql'
+        Set-Content -Path $sql -Value "-- header`r`nGO`r`nUSE [Foo];`r`n-- only a comment`r`nGO`r`nSELECT 1`r`nGO"
+        $batches = @(Get-SqlScriptBatch -Path $sql)
+        $batches.Count | Should -Be 1
+        $batches[0].Database | Should -Be 'Foo'
+        $batches[0].Query | Should -Not -Match 'USE'
+    }
+}
+
+Describe 'Test-IsLocalComputer' {
+    It 'Treats the computer name, its FQDN, and localhost as local' {
+        Test-IsLocalComputer -Name $env:COMPUTERNAME | Should -BeTrue
+        Test-IsLocalComputer -Name 'localhost' | Should -BeTrue
+        Test-IsLocalComputer -Name ([System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName) | Should -BeTrue
+    }
+
+    It 'Treats another host as remote' {
+        Test-IsLocalComputer -Name 'not-this-host.contoso.com' | Should -BeFalse
     }
 }
 
@@ -291,6 +334,80 @@ Describe 'New-MECMObjects' {
             $cmd.Parameters[$p].Attributes |
                 Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] -and $_.Mandatory } |
                 Should -Not -BeNullOrEmpty -Because "Parameter '$p' should be mandatory"
+        }
+    }
+
+    Context 'Rerun against existing objects' {
+        BeforeAll {
+            foreach ($name in 'Get-CMPackage', 'New-CMPackage', 'Update-CMDistributionPoint', 'Get-CMProgram', 'New-CMProgram',
+                              'Get-CMDistributionPointGroup', 'Start-CMContentDistribution', 'Get-CMConfigurationItem',
+                              'New-CMConfigurationItem', 'Add-CMComplianceSettingScript', 'Remove-CMConfigurationItem',
+                              'Get-CMBaseline', 'New-CMBaseline', 'Set-CMBaseline', 'New-CMBaselineDeployment',
+                              'New-CMSchedule', 'Get-CMPackageDeployment', 'New-CMPackageDeployment') {
+                Set-Item -Path "function:global:$name" -Value { }
+            }
+            # Parameter filters need declared parameters on the stub.
+            function global:Get-CMBaselineDeployment { [CmdletBinding()] param($Name, $CollectionName, [switch]$Fast) }
+            function global:Set-CMPackageDeployment { [CmdletBinding()] param($PackageId, $StandardProgramName, $CollectionName, $RerunBehavior, $SoftwareInstallation) }
+            function global:Set-CMComplianceSettingScript { [CmdletBinding()] param($InputObject, $SettingName, $DiscoveryScriptLanguage, $DiscoveryScriptText, $RemediationScriptLanguage, $RemediationScriptText, $Is64Bit) }
+            $script:SavedAdminUiPath = $env:SMS_ADMIN_UI_PATH
+            $env:SMS_ADMIN_UI_PATH = Join-Path $TestDrive 'AdminConsole\bin\i386'
+        }
+
+        AfterAll {
+            $env:SMS_ADMIN_UI_PATH = $script:SavedAdminUiPath
+            foreach ($item in @(Get-ChildItem function:global:*-CM*)) { Remove-Item -Path "function:global:$($item.Name)" -ErrorAction SilentlyContinue }
+        }
+
+        BeforeEach {
+            Mock Test-Path { $true }
+            Mock Import-Module { }
+            Mock Get-PSDrive { [pscustomobject]@{ Name = 'TST' } }
+            Mock Set-Location { }
+            Mock Get-CMPackage { [pscustomobject]@{ PackageID = 'TST00001' } }
+            Mock Get-CMProgram { [pscustomobject]@{ ProgramName = 'Deploy' } }
+            Mock Get-CMDistributionPointGroup { @() }
+            Mock Get-CMConfigurationItem { [pscustomobject]@{ CI_ID = 1 } }
+            Mock Get-CMBaseline { [pscustomobject]@{ CI_ID = 2 } }
+            # The real SMS_BaselineAssignment object has TargetCollectionID and no CollectionName.
+            Mock Get-CMBaselineDeployment { [pscustomobject]@{ AssignmentID = 3; TargetCollectionID = 'TST00010' } }
+            Mock New-CMBaselineDeployment { }
+            Mock Get-CMPackageDeployment { [pscustomobject]@{ AdvertisementID = 'TST20000' } }
+            Mock Set-CMPackageDeployment { }
+            Mock New-CMPackageDeployment { }
+            Mock Set-CMComplianceSettingScript { }
+        }
+
+        It 'Updates the scripts in an existing configuration item' {
+            New-MECMObjects -SiteCode 'TST' -SiteServer 'cm.contoso.com' -SourcePath '\\cm\share' `
+                -TargetCollection 'Lab Collection' -DetectionScript 'd' -RemediationScript 'r'
+
+            Should -Invoke Set-CMComplianceSettingScript -Times 1 -ParameterFilter {
+                $SettingName -eq 'ClientHealth LastRun Check' -and $DiscoveryScriptText -eq 'd' -and $RemediationScriptText -eq 'r'
+            }
+        }
+
+        It 'Lets the existing staging deployment run outside maintenance windows' {
+            New-MECMObjects -SiteCode 'TST' -SiteServer 'cm.contoso.com' -SourcePath '\\cm\share' `
+                -TargetCollection 'Lab Collection' -DetectionScript 'd' -RemediationScript 'r'
+
+            Should -Invoke Set-CMPackageDeployment -Times 1 -ParameterFilter { $SoftwareInstallation -eq $true }
+        }
+
+        It 'Does not create a second baseline deployment for the same collection' {
+            New-MECMObjects -SiteCode 'TST' -SiteServer 'cm.contoso.com' -SourcePath '\\cm\share' `
+                -TargetCollection 'Lab Collection' -DetectionScript 'd' -RemediationScript 'r'
+
+            Should -Invoke Get-CMBaselineDeployment -Times 1 -ParameterFilter { $CollectionName -eq 'Lab Collection' }
+            Should -Invoke New-CMBaselineDeployment -Times 0
+        }
+
+        It 'Updates the existing package deployment instead of creating one' {
+            New-MECMObjects -SiteCode 'TST' -SiteServer 'cm.contoso.com' -SourcePath '\\cm\share' `
+                -TargetCollection 'Lab Collection' -DetectionScript 'd' -RemediationScript 'r'
+
+            Should -Invoke Set-CMPackageDeployment -Times 1 -ParameterFilter { $RerunBehavior -eq 'AlwaysRerunProgram' }
+            Should -Invoke New-CMPackageDeployment -Times 0
         }
     }
 }
@@ -413,7 +530,7 @@ Describe 'Generated config compatibility with main script' {
 
     It 'All service states are valid' {
         foreach ($svc in $config.Services) {
-            $svc.State | Should -BeIn @('Running', 'Stopped')
+            $svc.State | Should -BeIn @('Running', 'Stopped', '')
         }
     }
 

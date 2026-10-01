@@ -46,6 +46,50 @@ function Get-XmlBool {
     return ($Value.ToString().ToLower() -eq 'true')
 }
 
+$installProperties = @($xml.Configuration.ClientInstallProperty | ForEach-Object { [string]$_ } | Where-Object { $_ })
+
+$managementPoints = @()
+if ($xml.Configuration.ManagementPoints) {
+    $managementPoints = @($xml.Configuration.ManagementPoints.MP | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+}
+if ($managementPoints.Count -eq 0) {
+    foreach ($token in $installProperties) {
+        if ($token -match '^(SMSMP|MP)=(.+)$') { $managementPoints += $Matches[2].Trim().Trim('"') }
+        elseif ($token -match '^/mp:(.+)$') { $managementPoints += $Matches[1].Trim().Trim('"') }
+    }
+    $managementPoints = @($managementPoints | Select-Object -Unique)
+}
+if ($managementPoints.Count -eq 0) {
+    Write-Warning 'No management point found in config.xml. Add Client.ManagementPoints to the output before deploying; client installs fail without it.'
+}
+
+# The client script injects SMSMP= and /mp: from Client.ManagementPoints at install time.
+$installProperties = @($installProperties | Where-Object { $_ -notmatch '^(SMSMP|MP)=' -and $_ -notmatch '^/mp:' })
+
+$cacheNode = $xml.Configuration.Client | Where-Object { $_.Name -like 'CacheSize' }
+$cacheSize = [string]$cacheNode.Value
+$cacheSizeNumber = 0
+# A percentage size such as "10%" stays a string; the client script supports both forms.
+$cacheSizeValue = if ([int]::TryParse($cacheSize, [ref]$cacheSizeNumber)) { $cacheSizeNumber } else { $cacheSize }
+
+$legacyShare = Get-XmlValue $xml.Configuration.Client 'Share'
+if ($legacyShare) {
+    Write-Warning "Client.Share ('$legacyShare') is not converted. ccmsetup.exe is downloaded from the management points."
+}
+
+$mpHttps = Get-XmlBool (Get-XmlValue $xml.Configuration.Client 'MPHttps')
+
+# Option attribute with the documented default when the attribute is absent (older config.xml files).
+function Get-OptionValue {
+    param([string]$Name, [string]$Property, $Default)
+    $node = $xml.Configuration.Option | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+    if (-not $node -or -not $node.HasAttribute($Property)) { return $Default }
+    $value = $node.GetAttribute($Property)
+    if ($Default -is [bool]) { return ($value -eq 'True') }
+    if ($Default -is [int]) { $n = 0; if ([int]::TryParse($value, [ref]$n)) { return $n }; return $Default }
+    return $value
+}
+
 # Build the JSON structure
 $config = [ordered]@{
     LocalFiles = $xml.Configuration.LocalFiles
@@ -55,11 +99,12 @@ $config = [ordered]@{
         SiteCode    = Get-XmlValue $xml.Configuration.Client 'SiteCode'
         Domain      = Get-XmlValue $xml.Configuration.Client 'Domain'
         AutoUpgrade = Get-XmlBool (Get-XmlValue $xml.Configuration.Client 'AutoUpgrade')
-        Share       = Get-XmlValue $xml.Configuration.Client 'Share'
+        ManagementPoints = @($managementPoints)
+        MPHttps     = $mpHttps
         Cache = [ordered]@{
-            Size              = [int](($xml.Configuration.Client | Where-Object { $_.Name -like 'CacheSize' }).Value)
-            DeleteOrphanedData = Get-XmlBool (($xml.Configuration.Client | Where-Object { $_.Name -like 'CacheSize' }).DeleteOrphanedData)
-            Enable            = Get-XmlBool (($xml.Configuration.Client | Where-Object { $_.Name -like 'CacheSize' }).Enable)
+            Size              = $cacheSizeValue
+            DeleteOrphanedData = Get-XmlBool $cacheNode.DeleteOrphanedData
+            Enable            = Get-XmlBool $cacheNode.Enable
         }
         Log = [ordered]@{
             MaxSize    = [int](($xml.Configuration.Client | Where-Object { $_.Name -like 'Log' }).MaxLogSize)
@@ -68,7 +113,7 @@ $config = [ordered]@{
         }
     }
 
-    ClientInstallProperties = @($xml.Configuration.ClientInstallProperty)
+    ClientInstallProperties = @($installProperties)
 
     Logging = [ordered]@{
         Share        = ($xml.Configuration.Log | Where-Object { $_.Name -like 'File' }).Share
@@ -88,6 +133,7 @@ $config = [ordered]@{
         BITSCheck          = [ordered]@{
             Enable = Get-XmlBool (Get-XmlValue $xml.Configuration.Option 'BITSCheck' 'Enable')
             Fix    = Get-XmlBool (Get-XmlValue $xml.Configuration.Option 'BITSCheck' 'Fix')
+            Days   = Get-OptionValue 'BITSCheck' 'Days' 7
         }
         ClientSettingsCheck = [ordered]@{
             Enable = Get-XmlBool (Get-XmlValue $xml.Configuration.Option 'ClientSettingsCheck' 'Enable')
@@ -131,6 +177,20 @@ $config = [ordered]@{
             Enable = Get-XmlBool (Get-XmlValue $xml.Configuration.Option 'RefreshComplianceState' 'Enable')
             Days   = [int](Get-XmlValue $xml.Configuration.Option 'RefreshComplianceState' 'Days')
         }
+        CcmEvalTask          = [ordered]@{ Enable = Get-OptionValue 'CcmEvalTask' 'Enable' $true; Fix = Get-OptionValue 'CcmEvalTask' 'Fix' $true }
+        ClientActivity       = [ordered]@{ Enable = Get-OptionValue 'ClientActivity' 'Enable' $true; Fix = Get-OptionValue 'ClientActivity' 'Fix' $true; Days = Get-OptionValue 'ClientActivity' 'Days' 7 }
+        WindowsUpdateSource  = [ordered]@{ Enable = Get-OptionValue 'WindowsUpdateSource' 'Enable' $true; Fix = Get-OptionValue 'WindowsUpdateSource' 'Fix' $true }
+        WindowsUpdateScan    = [ordered]@{ Enable = Get-OptionValue 'WindowsUpdateScan' 'Enable' $true; Fix = Get-OptionValue 'WindowsUpdateScan' 'Fix' $false; ResetDays = Get-OptionValue 'WindowsUpdateScan' 'ResetDays' 30 }
+        TlsConfiguration     = [ordered]@{ Enable = Get-OptionValue 'TlsConfiguration' 'Enable' $true; Fix = Get-OptionValue 'TlsConfiguration' 'Fix' $false }
+        CoManagement         = [ordered]@{ Enable = Get-OptionValue 'CoManagement' 'Enable' $true }
+        SecureChannel        = [ordered]@{ Enable = Get-OptionValue 'SecureChannel' 'Enable' $true }
+        ScriptPolicy         = [ordered]@{ Enable = Get-OptionValue 'ScriptPolicy' 'Enable' $true }
+        SiteCommunication    = [ordered]@{ Enable = Get-OptionValue 'SiteCommunication' 'Enable' $true }
+        PkiCertificate       = [ordered]@{ Enable = Get-OptionValue 'PkiCertificate' 'Enable' $false; Days = Get-OptionValue 'PkiCertificate' 'Days' 30 }
+        ClientIdentity       = [ordered]@{ Enable = Get-OptionValue 'ClientIdentity' 'Enable' $true }
+        DeliveryOptimization = [ordered]@{ Enable = Get-OptionValue 'DeliveryOptimization' 'Enable' $true }
+        InstallerCache       = [ordered]@{ Enable = Get-OptionValue 'InstallerCache' 'Enable' $true; Fix = Get-OptionValue 'InstallerCache' 'Fix' $true }
+        VCRuntime            = [ordered]@{ Enable = Get-OptionValue 'VCRuntime' 'Enable' $true; Fix = Get-OptionValue 'VCRuntime' 'Fix' $true }
     }
 
     Services = @(
